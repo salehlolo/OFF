@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 """
-Live Binance Futures Trend-Pullback Trader + Arabic Telegram Alerts
-===================================================================
+Live Binance USD-M Futures Trend-Pullback PAPER Simulator
+=========================================================
 
-Features
---------
-- Runs continuously on live Binance USDⓈ-M Futures data.
-- Selects top 5 USDT perpetual symbols by 24h quote volume.
-- Evaluates original trend-pullback logic (EMA20/EMA50 + volume + spread + optional RSI + ATR exits).
-- Keeps at most one open position across all symbols.
-- Uses 3x leverage sizing by default: 90 USD margin * 3 = 270 USD notional.
-- Tracks commission (default 0.04% per side), net PnL, and running account balance.
-- Sends Arabic Telegram alerts on entry, exit, and periodic summaries.
-- Writes detailed trades CSV and hourly summary CSV.
+- Continuous live market scanner (Top 5 USDT perpetual symbols by 24h quote volume).
+- Strict global single-position mode (one open position at any moment).
+- PAPER only (no real order placement).
 
-Important
----------
-This script is for strategy simulation / paper execution flow against live market data.
-It does NOT place exchange orders.
+How to run
+----------
+1) Default run:
+   python futures_trend_pullback_telegram.py
+
+2) Faster loop checks (for monitoring/testing):
+   python futures_trend_pullback_telegram.py --loop-sleep-seconds 15
+
+3) Allow only one closed trade then stop opening new trades:
+   python futures_trend_pullback_telegram.py --max-total-trades 1
 """
 
 from __future__ import annotations
@@ -30,7 +29,9 @@ import random
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP, getcontext
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import requests
 from requests import Response
@@ -41,6 +42,9 @@ try:
 except ImportError:  # pragma: no cover
     load_dotenv = None
 
+# Decimal precision for financial calculations
+getcontext().prec = 28
+
 # -----------------------------
 # Binance API constants
 # -----------------------------
@@ -48,13 +52,19 @@ FUTURES_BASE = "https://fapi.binance.com"
 KLINES_ENDPOINT = "/fapi/v1/klines"
 BOOK_TICKER_ENDPOINT = "/fapi/v1/ticker/bookTicker"
 TICKER_24HR_ENDPOINT = "/fapi/v1/ticker/24hr"
+PREMIUM_INDEX_ENDPOINT = "/fapi/v1/premiumIndex"
 
 TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
-REQUEST_TIMEOUT = (5, 20)  # connect, read
+REQUEST_TIMEOUT = (5, 20)
 MAX_RETRIES = 5
 INITIAL_BACKOFF = 1.0
 MAX_BACKOFF = 20.0
 JITTER_MAX = 0.5
+
+CAIRO_TZ = ZoneInfo("Africa/Cairo")
+DEC_ZERO = Decimal("0")
+DEC_ONE = Decimal("1")
+EPS = Decimal("1e-9")
 
 
 # -----------------------------
@@ -73,16 +83,16 @@ class Config:
     volume_ma_period: int = 20
 
     use_rsi_filter: bool = True
-    rsi_threshold: float = 50.0
-    max_spread: float = 0.1
+    rsi_threshold: Decimal = Decimal("50")
+    max_spread: Decimal = Decimal("0.1")
 
-    atr_sl_mult: float = 1.0
-    rr_ratio: float = 1.5
+    atr_sl_mult: Decimal = Decimal("1")
+    rr_ratio: Decimal = Decimal("1.5")
 
-    initial_balance: float = 100.0
-    margin_per_trade: float = 90.0
-    leverage: float = 3.0
-    fee_rate: float = 0.0004  # 0.04% per side
+    initial_balance: Decimal = Decimal("100")
+    margin_per_trade: Decimal = Decimal("90")
+    leverage: Decimal = Decimal("3")
+    fee_rate: Decimal = Decimal("0.0004")
 
     loop_sleep_seconds: int = 60
     summary_interval_seconds: int = 3600
@@ -91,18 +101,18 @@ class Config:
     trades_csv: str = "backtest_results.csv"
     summary_csv: str = "hourly_summary.csv"
 
-    # optional test helper to stop loop; None = infinite
     max_loops: int | None = None
+    max_total_trades: int | None = None
 
 
 @dataclass
 class Candle:
     open_time: int
-    open: float
-    high: float
-    low: float
-    close: float
-    volume: float
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: Decimal
     close_time: int
 
 
@@ -111,10 +121,27 @@ class Position:
     symbol: str
     direction: str  # LONG | SHORT
     entry_time: int
-    entry_price: float
-    qty: float
-    stop_loss: float
-    take_profit: float
+    entry_fill_price: Decimal
+    qty: Decimal
+    stop_loss: Decimal
+    take_profit: Decimal
+    entry_notional: Decimal
+    entry_spread: Decimal
+    volume_ratio: Decimal
+    rsi_value: Decimal
+
+
+@dataclass
+class CandidateSignal:
+    symbol: str
+    direction: str
+    score: Decimal
+    spread: Decimal
+    atr_value: Decimal
+    volume_ratio: Decimal
+    rsi_value: Decimal
+    bid: Decimal
+    ask: Decimal
 
 
 @dataclass
@@ -122,25 +149,65 @@ class Trade:
     timestamp: int
     symbol: str
     direction: str
-    entry_price: float
-    exit_price: float
-    quantity: float
-    gross_pnl: float
-    fees: float
-    net_pnl: float
-    balance: float
+    entry_fill_price: Decimal
+    exit_fill_price: Decimal
+    quantity: Decimal
+    entry_notional: Decimal
+    exit_notional: Decimal
+    gross_pnl: Decimal
+    fees: Decimal
+    net_pnl: Decimal
+    balance_after: Decimal
     exit_reason: str
 
 
 @dataclass
 class HourlySummary:
     timestamp: int
-    pnl_total: float
-    pnl_last_hour: float
+    profit_last_hour: Decimal
+    loss_last_hour: Decimal
+    net_last_hour: Decimal
+    profit_total: Decimal
+    loss_total: Decimal
+    net_total: Decimal
+    fees_last_hour: Decimal
+    fees_total: Decimal
     total_trades: int
     wins: int
     losses: int
-    balance: float
+    win_rate: Decimal
+    balance: Decimal
+
+
+# -----------------------------
+# Utility
+# -----------------------------
+def d(raw: Any) -> Decimal:
+    return Decimal(str(raw))
+
+
+def fmt2(val: Decimal) -> str:
+    return str(val.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def fmt4(val: Decimal) -> str:
+    return str(val.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP))
+
+
+def fmt6(val: Decimal) -> str:
+    return str(val.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP))
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def cairo_now_text() -> str:
+    return datetime.now(tz=CAIRO_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def ms_to_cairo_text(ts_ms: int) -> str:
+    return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).astimezone(CAIRO_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 # -----------------------------
@@ -156,7 +223,7 @@ def setup_logging() -> None:
 
 def maybe_load_dotenv() -> None:
     if load_dotenv is None:
-        logging.info("python-dotenv is not installed; skipping .env loading")
+        logging.info("python-dotenv not installed; skipping .env loading")
         return
     if load_dotenv():
         logging.info("Loaded environment variables from .env")
@@ -168,9 +235,9 @@ def parse_bool(raw: str | None, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def env_float(name: str, default: float) -> float:
+def env_decimal(name: str, default: str) -> Decimal:
     raw = os.getenv(name)
-    return float(raw) if raw and raw.strip() else default
+    return d(raw) if raw and raw.strip() else d(default)
 
 
 def env_int(name: str, default: int) -> int:
@@ -179,6 +246,9 @@ def env_int(name: str, default: int) -> int:
 
 
 def load_config_from_env() -> Config:
+    max_total_trades_raw = os.getenv("MAX_TOTAL_TRADES")
+    max_total_trades = int(max_total_trades_raw) if max_total_trades_raw and max_total_trades_raw.strip() else None
+
     return Config(
         interval=os.getenv("INTERVAL", "1m"),
         candle_limit=env_int("CANDLE_LIMIT", 150),
@@ -189,19 +259,20 @@ def load_config_from_env() -> Config:
         atr_period=env_int("ATR_PERIOD", 14),
         volume_ma_period=env_int("VOLUME_MA_PERIOD", 20),
         use_rsi_filter=parse_bool(os.getenv("USE_RSI_FILTER"), True),
-        rsi_threshold=env_float("RSI_THRESHOLD", 50.0),
-        max_spread=env_float("MAX_SPREAD", 0.1),
-        atr_sl_mult=env_float("ATR_SL_MULT", 1.0),
-        rr_ratio=env_float("RR_RATIO", 1.5),
-        initial_balance=env_float("INITIAL_BALANCE", 100.0),
-        margin_per_trade=env_float("MARGIN_PER_TRADE", 90.0),
-        leverage=env_float("LEVERAGE", 3.0),
-        fee_rate=env_float("FEE_RATE", 0.0004),
+        rsi_threshold=env_decimal("RSI_THRESHOLD", "50"),
+        max_spread=env_decimal("MAX_SPREAD", "0.1"),
+        atr_sl_mult=env_decimal("ATR_SL_MULT", "1"),
+        rr_ratio=env_decimal("RR_RATIO", "1.5"),
+        initial_balance=env_decimal("INITIAL_BALANCE", "100"),
+        margin_per_trade=env_decimal("MARGIN_PER_TRADE", "90"),
+        leverage=env_decimal("LEVERAGE", "3"),
+        fee_rate=env_decimal("FEE_RATE", "0.0004"),
         loop_sleep_seconds=env_int("LOOP_SLEEP_SECONDS", 60),
         summary_interval_seconds=env_int("SUMMARY_INTERVAL_SECONDS", 3600),
         send_telegram=parse_bool(os.getenv("SEND_TELEGRAM"), True),
         trades_csv=os.getenv("TRADES_CSV", "backtest_results.csv"),
         summary_csv=os.getenv("SUMMARY_CSV", "hourly_summary.csv"),
+        max_total_trades=max_total_trades,
     )
 
 
@@ -214,22 +285,24 @@ def validate_config(cfg: Config) -> None:
         raise ValueError("Invalid EMA settings")
     if cfg.rsi_period <= 1 or cfg.atr_period <= 1 or cfg.volume_ma_period <= 1:
         raise ValueError("Indicator periods must be > 1")
-    if cfg.max_spread < 0:
+    if cfg.max_spread < DEC_ZERO:
         raise ValueError("max_spread must be >= 0")
-    if cfg.atr_sl_mult <= 0 or cfg.rr_ratio <= 0:
+    if cfg.atr_sl_mult <= DEC_ZERO or cfg.rr_ratio <= DEC_ZERO:
         raise ValueError("ATR multipliers must be > 0")
-    if cfg.initial_balance <= 0:
+    if cfg.initial_balance <= DEC_ZERO:
         raise ValueError("initial_balance must be > 0")
-    if cfg.margin_per_trade <= 0:
+    if cfg.margin_per_trade <= DEC_ZERO:
         raise ValueError("margin_per_trade must be > 0")
-    if cfg.leverage <= 0:
+    if cfg.leverage <= DEC_ZERO:
         raise ValueError("leverage must be > 0")
-    if cfg.fee_rate < 0:
+    if cfg.fee_rate < DEC_ZERO:
         raise ValueError("fee_rate must be >= 0")
     if cfg.loop_sleep_seconds <= 0:
         raise ValueError("loop_sleep_seconds must be > 0")
     if cfg.summary_interval_seconds <= 0:
         raise ValueError("summary_interval_seconds must be > 0")
+    if cfg.max_total_trades is not None and cfg.max_total_trades < 0:
+        raise ValueError("max_total_trades must be >= 0")
 
 
 # -----------------------------
@@ -259,17 +332,10 @@ def request_with_retry(
                 json=json_payload,
                 timeout=REQUEST_TIMEOUT,
             )
-            if response.status_code in TRANSIENT_STATUSES:
-                logging.warning(
-                    "Transient HTTP %s for %s (attempt %d/%d)",
-                    response.status_code,
-                    url,
-                    attempt,
-                    MAX_RETRIES,
-                )
-                if attempt < MAX_RETRIES:
-                    sleep_backoff(attempt)
-                    continue
+            if response.status_code in TRANSIENT_STATUSES and attempt < MAX_RETRIES:
+                logging.warning("Transient HTTP %s for %s (attempt %d/%d)", response.status_code, url, attempt, MAX_RETRIES)
+                sleep_backoff(attempt)
+                continue
             return response
         except (Timeout, RequestException) as exc:
             last_exc = exc
@@ -287,81 +353,83 @@ def fetch_top_symbols(session: requests.Session, top_n: int) -> list[str]:
     url = FUTURES_BASE + TICKER_24HR_ENDPOINT
     resp = request_with_retry(session, "GET", url)
     if resp.status_code != 200:
-        raise RuntimeError(f"24hr ticker request failed: HTTP {resp.status_code} - {resp.text}")
+        raise RuntimeError(f"24hr ticker failed: HTTP {resp.status_code} - {resp.text}")
 
     payload = resp.json()
     if not isinstance(payload, list):
-        raise RuntimeError("Unexpected 24hr ticker payload format")
+        raise RuntimeError("Unexpected /ticker/24hr payload")
 
-    candidates: list[tuple[str, float]] = []
+    candidates: list[tuple[str, Decimal]] = []
     for row in payload:
         if not isinstance(row, dict):
             continue
         symbol = str(row.get("symbol", ""))
-        if not symbol.endswith("USDT"):
-            continue
-        # Exclude dated contracts like BTCUSDT_240329
-        if "_" in symbol:
+        if not symbol.endswith("USDT") or "_" in symbol:
             continue
         try:
-            quote_volume = float(row.get("quoteVolume", 0.0))
-        except (TypeError, ValueError):
+            qv = d(row.get("quoteVolume", "0"))
+        except Exception:
             continue
-        candidates.append((symbol, quote_volume))
-
-    if not candidates:
-        raise RuntimeError("No USDT perpetual futures symbols found in 24hr ticker")
+        candidates.append((symbol, qv))
 
     candidates.sort(key=lambda x: x[1], reverse=True)
-    return [symbol for symbol, _ in candidates[:top_n]]
+    return [s for s, _ in candidates[:top_n]]
 
 
 def fetch_klines(session: requests.Session, symbol: str, interval: str, limit: int) -> list[Candle]:
     url = FUTURES_BASE + KLINES_ENDPOINT
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    resp = request_with_retry(session, "GET", url, params=params)
+    resp = request_with_retry(session, "GET", url, params={"symbol": symbol, "interval": interval, "limit": limit})
     if resp.status_code != 200:
-        raise RuntimeError(f"Klines request failed for {symbol}: HTTP {resp.status_code} - {resp.text}")
+        raise RuntimeError(f"Klines failed for {symbol}: HTTP {resp.status_code} - {resp.text}")
 
     payload = resp.json()
     if not isinstance(payload, list) or not payload:
-        raise RuntimeError(f"Invalid/empty kline payload for {symbol}")
+        raise RuntimeError(f"Invalid klines payload for {symbol}")
 
-    candles = [
+    return [
         Candle(
             open_time=int(x[0]),
-            open=float(x[1]),
-            high=float(x[2]),
-            low=float(x[3]),
-            close=float(x[4]),
-            volume=float(x[5]),
+            open=d(x[1]),
+            high=d(x[2]),
+            low=d(x[3]),
+            close=d(x[4]),
+            volume=d(x[5]),
             close_time=int(x[6]),
         )
         for x in payload
     ]
-    return candles
 
 
-def fetch_spread(session: requests.Session, symbol: str) -> float:
+def fetch_book_ticker(session: requests.Session, symbol: str) -> tuple[Decimal, Decimal, Decimal]:
     url = FUTURES_BASE + BOOK_TICKER_ENDPOINT
     resp = request_with_retry(session, "GET", url, params={"symbol": symbol})
     if resp.status_code != 200:
-        raise RuntimeError(f"BookTicker request failed for {symbol}: HTTP {resp.status_code} - {resp.text}")
-
+        raise RuntimeError(f"BookTicker failed for {symbol}: HTTP {resp.status_code} - {resp.text}")
     payload = resp.json()
     if not isinstance(payload, dict):
         raise RuntimeError(f"Invalid bookTicker payload for {symbol}")
 
-    bid = float(payload["bidPrice"])
-    ask = float(payload["askPrice"])
+    bid = d(payload["bidPrice"])
+    ask = d(payload["askPrice"])
     spread = ask - bid
-    if spread < 0:
-        raise RuntimeError(f"Negative spread for {symbol}: {spread}")
-    return spread
+    if spread < DEC_ZERO:
+        raise RuntimeError(f"Negative spread for {symbol}")
+    return bid, ask, spread
+
+
+def fetch_mark_price(session: requests.Session, symbol: str) -> Decimal | None:
+    url = FUTURES_BASE + PREMIUM_INDEX_ENDPOINT
+    resp = request_with_retry(session, "GET", url, params={"symbol": symbol})
+    if resp.status_code != 200:
+        return None
+    payload = resp.json()
+    if not isinstance(payload, dict) or "markPrice" not in payload:
+        return None
+    return d(payload["markPrice"])
 
 
 # -----------------------------
-# Indicators
+# Indicators (float math)
 # -----------------------------
 def ema(values: list[float], period: int) -> list[float | None]:
     out: list[float | None] = [None] * len(values)
@@ -403,13 +471,13 @@ def rsi(values: list[float], period: int) -> list[float | None]:
     avg_gain = sum(gains) / period
     avg_loss = sum(losses) / period
 
-    def calc_rsi(g: float, l: float) -> float:
+    def calc(g: float, l: float) -> float:
         if l == 0:
             return 100.0
         rs = g / l
-        return 100.0 - (100.0 / (1.0 + rs))
+        return 100.0 - (100.0 / (1 + rs))
 
-    out[period] = calc_rsi(avg_gain, avg_loss)
+    out[period] = calc(avg_gain, avg_loss)
 
     for i in range(period + 1, len(values)):
         delta = values[i] - values[i - 1]
@@ -417,7 +485,7 @@ def rsi(values: list[float], period: int) -> list[float | None]:
         loss = max(-delta, 0.0)
         avg_gain = ((avg_gain * (period - 1)) + gain) / period
         avg_loss = ((avg_loss * (period - 1)) + loss) / period
-        out[i] = calc_rsi(avg_gain, avg_loss)
+        out[i] = calc(avg_gain, avg_loss)
 
     return out
 
@@ -429,15 +497,12 @@ def atr(candles: list[Candle], period: int) -> list[float | None]:
 
     tr_values: list[float] = []
     for i, candle in enumerate(candles):
+        h, l = float(candle.high), float(candle.low)
         if i == 0:
-            tr = candle.high - candle.low
+            tr = h - l
         else:
-            prev_close = candles[i - 1].close
-            tr = max(
-                candle.high - candle.low,
-                abs(candle.high - prev_close),
-                abs(candle.low - prev_close),
-            )
+            prev_close = float(candles[i - 1].close)
+            tr = max(h - l, abs(h - prev_close), abs(l - prev_close))
         tr_values.append(tr)
 
     prev_atr = sum(tr_values[1 : period + 1]) / period
@@ -468,27 +533,25 @@ def send_telegram_message(session: requests.Session, text: str) -> None:
         raise RuntimeError(f"Telegram sendMessage failed: HTTP {resp.status_code} - {resp.text}")
 
 
-def fmt_ts(ms: int) -> str:
-    return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-
 def init_trade_csv(path: str) -> None:
     if os.path.exists(path):
         return
     with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(
+        w = csv.writer(f)
+        w.writerow(
             [
-                "timestamp",
+                "timestamp_cairo",
                 "symbol",
                 "direction",
-                "entry_price",
-                "exit_price",
+                "entry_fill_price",
+                "exit_fill_price",
                 "quantity",
+                "entry_notional",
+                "exit_notional",
                 "gross_pnl",
-                "commission",
+                "fees",
                 "net_pnl",
-                "balance",
+                "balance_after",
                 "exit_reason",
             ]
         )
@@ -496,19 +559,21 @@ def init_trade_csv(path: str) -> None:
 
 def append_trade_csv(path: str, trade: Trade) -> None:
     with open(path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(
+        w = csv.writer(f)
+        w.writerow(
             [
-                fmt_ts(trade.timestamp),
+                ms_to_cairo_text(trade.timestamp),
                 trade.symbol,
                 trade.direction,
-                f"{trade.entry_price:.8f}",
-                f"{trade.exit_price:.8f}",
-                f"{trade.quantity:.8f}",
-                f"{trade.gross_pnl:.8f}",
-                f"{trade.fees:.8f}",
-                f"{trade.net_pnl:.8f}",
-                f"{trade.balance:.8f}",
+                fmt6(trade.entry_fill_price),
+                fmt6(trade.exit_fill_price),
+                fmt6(trade.quantity),
+                fmt6(trade.entry_notional),
+                fmt6(trade.exit_notional),
+                fmt6(trade.gross_pnl),
+                fmt6(trade.fees),
+                fmt6(trade.net_pnl),
+                fmt6(trade.balance_after),
                 trade.exit_reason,
             ]
         )
@@ -518,369 +583,576 @@ def init_summary_csv(path: str) -> None:
     if os.path.exists(path):
         return
     with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["timestamp", "pnl_total", "pnl_last_hour", "total_trades", "wins", "losses", "balance"])
+        w = csv.writer(f)
+        w.writerow(
+            [
+                "timestamp_cairo",
+                "profit_last_hour",
+                "loss_last_hour",
+                "net_last_hour",
+                "profit_total",
+                "loss_total",
+                "net_total",
+                "fees_last_hour",
+                "fees_total",
+                "total_trades",
+                "wins",
+                "losses",
+                "win_rate_pct",
+                "balance",
+            ]
+        )
 
 
 def append_summary_csv(path: str, summary: HourlySummary) -> None:
     with open(path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(
+        w = csv.writer(f)
+        w.writerow(
             [
-                fmt_ts(summary.timestamp),
-                f"{summary.pnl_total:.8f}",
-                f"{summary.pnl_last_hour:.8f}",
+                ms_to_cairo_text(summary.timestamp),
+                fmt6(summary.profit_last_hour),
+                fmt6(summary.loss_last_hour),
+                fmt6(summary.net_last_hour),
+                fmt6(summary.profit_total),
+                fmt6(summary.loss_total),
+                fmt6(summary.net_total),
+                fmt6(summary.fees_last_hour),
+                fmt6(summary.fees_total),
                 summary.total_trades,
                 summary.wins,
                 summary.losses,
-                f"{summary.balance:.8f}",
+                fmt4(summary.win_rate),
+                fmt6(summary.balance),
             ]
         )
 
 
 # -----------------------------
-# Strategy logic
+# Strategy evaluation
 # -----------------------------
-def generate_entry_signal(cfg: Config, candles: list[Candle], spread: float) -> tuple[str | None, float | None]:
-    closes = [c.close for c in candles]
-    volumes = [c.volume for c in candles]
+def evaluate_candidate_signal(cfg: Config, symbol: str, candles: list[Candle], bid: Decimal, ask: Decimal, spread: Decimal) -> CandidateSignal | None:
+    closes = [float(c.close) for c in candles]
+    volumes = [float(c.volume) for c in candles]
 
-    ema_fast_values = ema(closes, cfg.ema_fast)
-    ema_trend_values = ema(closes, cfg.ema_trend)
-    rsi_values = rsi(closes, cfg.rsi_period)
-    atr_values = atr(candles, cfg.atr_period)
-    vol_ma_values = sma(volumes, cfg.volume_ma_period)
+    ema_fast_vals = ema(closes, cfg.ema_fast)
+    ema_trend_vals = ema(closes, cfg.ema_trend)
+    rsi_vals = rsi(closes, cfg.rsi_period)
+    atr_vals = atr(candles, cfg.atr_period)
+    vma_vals = sma(volumes, cfg.volume_ma_period)
 
     i = len(candles) - 1
     c = candles[i]
     prev = candles[i - 1]
 
-    e20 = ema_fast_values[i]
-    e50 = ema_trend_values[i]
-    r = rsi_values[i]
-    a = atr_values[i]
-    vma = vol_ma_values[i]
-    prev_e20 = ema_fast_values[i - 1]
+    e20 = ema_fast_vals[i]
+    e50 = ema_trend_vals[i]
+    r = rsi_vals[i]
+    a = atr_vals[i]
+    vma = vma_vals[i]
+    prev_e20 = ema_fast_vals[i - 1]
 
     if any(v is None for v in [e20, e50, r, a, vma, prev_e20]):
-        return None, None
+        return None
 
-    volume_ok = c.volume > float(vma)
+    c_close = float(c.close)
+    c_vol = float(c.volume)
+    prev_close = float(prev.close)
+
+    volume_ok = c_vol > float(vma)
     spread_ok = spread <= cfg.max_spread
     if not volume_ok or not spread_ok:
-        return None, None
+        return None
 
-    long_trend = c.close > float(e50)
-    short_trend = c.close < float(e50)
-    long_trigger = prev.close <= float(prev_e20) and c.close > float(e20)
-    short_trigger = prev.close >= float(prev_e20) and c.close < float(e20)
+    long_trend = c_close > float(e50)
+    short_trend = c_close < float(e50)
+    long_trigger = prev_close <= float(prev_e20) and c_close > float(e20)
+    short_trigger = prev_close >= float(prev_e20) and c_close < float(e20)
 
-    long_rsi_ok = (float(r) > cfg.rsi_threshold) if cfg.use_rsi_filter else True
-    short_rsi_ok = (float(r) < cfg.rsi_threshold) if cfg.use_rsi_filter else True
+    rsi_val = d(r)
+    long_rsi_ok = (rsi_val > cfg.rsi_threshold) if cfg.use_rsi_filter else True
+    short_rsi_ok = (rsi_val < cfg.rsi_threshold) if cfg.use_rsi_filter else True
 
+    direction: str | None = None
     if long_trend and long_trigger and long_rsi_ok:
-        return "LONG", float(a)
-    if short_trend and short_trigger and short_rsi_ok:
-        return "SHORT", float(a)
-
-    return None, None
-
-
-def evaluate_position_exit(position: Position, candle: Candle, fee_rate: float, balance: float) -> tuple[Trade | None, float]:
-    exit_price: float | None = None
-    reason = ""
-
-    if position.direction == "LONG":
-        sl_hit = candle.low <= position.stop_loss
-        tp_hit = candle.high >= position.take_profit
-        if sl_hit and tp_hit:
-            exit_price = position.stop_loss
-            reason = "SL_and_TP_same_candle_assume_SL"
-        elif sl_hit:
-            exit_price = position.stop_loss
-            reason = "SL"
-        elif tp_hit:
-            exit_price = position.take_profit
-            reason = "TP"
-    else:
-        sl_hit = candle.high >= position.stop_loss
-        tp_hit = candle.low <= position.take_profit
-        if sl_hit and tp_hit:
-            exit_price = position.stop_loss
-            reason = "SL_and_TP_same_candle_assume_SL"
-        elif sl_hit:
-            exit_price = position.stop_loss
-            reason = "SL"
-        elif tp_hit:
-            exit_price = position.take_profit
-            reason = "TP"
-
-    if exit_price is None:
-        return None, balance
-
-    entry_notional = position.entry_price * position.qty
-    exit_notional = exit_price * position.qty
-    fees = (entry_notional * fee_rate) + (exit_notional * fee_rate)
-
-    if position.direction == "LONG":
-        gross = (exit_price - position.entry_price) * position.qty
-    else:
-        gross = (position.entry_price - exit_price) * position.qty
-
-    net = gross - fees
-    balance += net
-
-    trade = Trade(
-        timestamp=candle.close_time,
-        symbol=position.symbol,
-        direction="شراء" if position.direction == "LONG" else "بيع",
-        entry_price=position.entry_price,
-        exit_price=exit_price,
-        quantity=position.qty,
-        gross_pnl=gross,
-        fees=fees,
-        net_pnl=net,
-        balance=balance,
-        exit_reason=reason,
-    )
-    return trade, balance
-
-
-# -----------------------------
-# Live loop
-# -----------------------------
-def create_open_position(symbol: str, direction: str, atr_value: float, candles: list[Candle], cfg: Config) -> Position | None:
-    entry_price = candles[-1].close
-    if entry_price <= 0:
+        direction = "LONG"
+    elif short_trend and short_trigger and short_rsi_ok:
+        direction = "SHORT"
+    if direction is None:
         return None
 
-    notional = cfg.margin_per_trade * cfg.leverage
-    qty = notional / entry_price
-    if qty <= 0:
+    atr_val = d(a)
+    if atr_val <= DEC_ZERO:
         return None
 
-    risk = cfg.atr_sl_mult * atr_value
-    if risk <= 0:
-        return None
+    volume_ratio = d(c_vol) / d(vma)
+    atr_pct = atr_val / c.close if c.close > DEC_ZERO else DEC_ZERO
+    score = (volume_ratio / (spread + EPS)) * (DEC_ONE + atr_pct)
 
-    if direction == "LONG":
-        stop_loss = entry_price - risk
-        take_profit = entry_price + (cfg.rr_ratio * risk)
-    else:
-        stop_loss = entry_price + risk
-        take_profit = entry_price - (cfg.rr_ratio * risk)
-
-    return Position(
+    return CandidateSignal(
         symbol=symbol,
         direction=direction,
-        entry_time=candles[-1].close_time,
-        entry_price=entry_price,
+        score=score,
+        spread=spread,
+        atr_value=atr_val,
+        volume_ratio=volume_ratio,
+        rsi_value=rsi_val,
+        bid=bid,
+        ask=ask,
+    )
+
+
+def create_position_from_candidate(cfg: Config, candidate: CandidateSignal, latest_close_time: int) -> Position | None:
+    entry_fill = candidate.ask if candidate.direction == "LONG" else candidate.bid
+    if entry_fill <= DEC_ZERO:
+        return None
+
+    notional = cfg.margin_per_trade * cfg.leverage  # must remain 90*3 by default
+    qty = notional / entry_fill
+    if qty <= DEC_ZERO:
+        return None
+
+    risk = cfg.atr_sl_mult * candidate.atr_value
+    if risk <= DEC_ZERO:
+        return None
+
+    if candidate.direction == "LONG":
+        stop_loss = entry_fill - risk
+        take_profit = entry_fill + (cfg.rr_ratio * risk)
+    else:
+        stop_loss = entry_fill + risk
+        take_profit = entry_fill - (cfg.rr_ratio * risk)
+
+    return Position(
+        symbol=candidate.symbol,
+        direction=candidate.direction,
+        entry_time=latest_close_time,
+        entry_fill_price=entry_fill,
         qty=qty,
         stop_loss=stop_loss,
         take_profit=take_profit,
+        entry_notional=entry_fill * qty,
+        entry_spread=candidate.spread,
+        volume_ratio=candidate.volume_ratio,
+        rsi_value=candidate.rsi_value,
     )
 
 
-def send_entry_alert_ar(session: requests.Session, pos: Position, cfg: Config) -> None:
-    text = (
-        "🟢 فتح صفقة جديدة\n"
-        f"رمز العقد: {pos.symbol}\n"
-        f"الاتجاه: {'شراء' if pos.direction == 'LONG' else 'بيع'}\n"
-        f"سعر الدخول: {pos.entry_price:.4f}\n"
-        f"الكمية: {pos.qty:.6f}\n"
-        f"وقف الخسارة: {pos.stop_loss:.4f}\n"
-        f"جني الأرباح: {pos.take_profit:.4f}\n"
-        f"الرافعة: {cfg.leverage:.1f}x\n"
-        f"حجم الصفقة (هامش): {cfg.margin_per_trade:.2f} USDT"
+def evaluate_live_exit(position: Position, bid: Decimal, ask: Decimal, fee_rate: Decimal, balance: Decimal) -> tuple[Trade | None, Decimal]:
+    exit_reason = ""
+    exit_fill: Decimal | None = None
+
+    # Conservative trigger + executable fill
+    if position.direction == "LONG":
+        if bid <= position.stop_loss:
+            exit_reason = "SL"
+            exit_fill = bid
+        elif bid >= position.take_profit:
+            exit_reason = "TP"
+            exit_fill = bid
+    else:
+        if ask >= position.stop_loss:
+            exit_reason = "SL"
+            exit_fill = ask
+        elif ask <= position.take_profit:
+            exit_reason = "TP"
+            exit_fill = ask
+
+    if exit_fill is None:
+        return None, balance
+
+    exit_notional = exit_fill * position.qty
+    fees = (position.entry_notional * fee_rate) + (exit_notional * fee_rate)
+
+    if position.direction == "LONG":
+        gross = (exit_fill - position.entry_fill_price) * position.qty
+        dir_ar = "شراء"
+    else:
+        gross = (position.entry_fill_price - exit_fill) * position.qty
+        dir_ar = "بيع"
+
+    net = gross - fees
+    new_balance = balance + net
+
+    trade = Trade(
+        timestamp=now_ms(),
+        symbol=position.symbol,
+        direction=dir_ar,
+        entry_fill_price=position.entry_fill_price,
+        exit_fill_price=exit_fill,
+        quantity=position.qty,
+        entry_notional=position.entry_notional,
+        exit_notional=exit_notional,
+        gross_pnl=gross,
+        fees=fees,
+        net_pnl=net,
+        balance_after=new_balance,
+        exit_reason=exit_reason,
     )
-    send_telegram_message(session, text)
+    return trade, new_balance
 
 
-def send_close_alert_ar(session: requests.Session, trade: Trade) -> None:
-    text = (
+def estimate_unrealized(position: Position, bid: Decimal, ask: Decimal, fee_rate: Decimal) -> tuple[Decimal, Decimal]:
+    if position.direction == "LONG":
+        exit_fill = bid
+        gross = (exit_fill - position.entry_fill_price) * position.qty
+    else:
+        exit_fill = ask
+        gross = (position.entry_fill_price - exit_fill) * position.qty
+
+    exit_notional = exit_fill * position.qty
+    est_fees = (position.entry_notional * fee_rate) + (exit_notional * fee_rate)
+    net_est = gross - est_fees
+    return gross, net_est
+
+
+# -----------------------------
+# Telegram message builders (Arabic)
+# -----------------------------
+def send_entry_alert_ar(session: requests.Session, cfg: Config, pos: Position, candidate: CandidateSignal) -> None:
+    msg = (
+        "🟢 فتح صفقة (تجريبي)\n"
+        f"🕒 الوقت (القاهرة): {cairo_now_text()}\n"
+        f"📌 الرمز: {pos.symbol}\n"
+        f"📈 الاتجاه: {'شراء' if pos.direction == 'LONG' else 'بيع'}\n"
+        f"⚙️ الرافعة: x{fmt2(cfg.leverage)} | الهامش: {fmt2(cfg.margin_per_trade)} USDT | النوتيشنال: {fmt2(cfg.margin_per_trade * cfg.leverage)} USDT\n"
+        f"💲 سعر الدخول (تنفيذ): {fmt4(pos.entry_fill_price)} | Bid: {fmt4(candidate.bid)} | Ask: {fmt4(candidate.ask)}\n"
+        f"↔️ السبريد: {fmt4(candidate.spread)}\n"
+        f"🛑 وقف الخسارة: {fmt4(pos.stop_loss)} | 🎯 جني الأرباح: {fmt4(pos.take_profit)}\n"
+        f"📊 Volume/VMA20: {fmt4(pos.volume_ratio)} | RSI: {fmt4(pos.rsi_value)} {'(مفعل)' if cfg.use_rsi_filter else '(غير مفعل)'}"
+    )
+    send_telegram_message(session, msg)
+
+
+def send_exit_alert_ar(session: requests.Session, trade: Trade) -> None:
+    msg = (
         "🔴 إغلاق صفقة\n"
-        f"رمز العقد: {trade.symbol}\n"
-        f"الاتجاه: {trade.direction}\n"
-        f"سعر الدخول: {trade.entry_price:.4f}\n"
-        f"سعر الخروج: {trade.exit_price:.4f}\n"
-        f"الربح/الخسارة الإجمالي: {trade.gross_pnl:.4f} USDT\n"
-        f"العمولات: {trade.fees:.4f} USDT\n"
-        f"الربح/الخسارة الصافي: {trade.net_pnl:.4f} USDT\n"
-        f"الرصيد الحالي: {trade.balance:.4f} USDT\n"
-        f"سبب الإغلاق: {trade.exit_reason}"
+        f"🕒 الوقت (القاهرة): {cairo_now_text()}\n"
+        f"📌 الرمز: {trade.symbol} | الاتجاه: {trade.direction}\n"
+        f"💲 دخول: {fmt4(trade.entry_fill_price)} | خروج: {fmt4(trade.exit_fill_price)}\n"
+        f"📦 الكمية: {fmt6(trade.quantity)}\n"
+        f"📈 الربح/الخسارة الإجمالي: {fmt4(trade.gross_pnl)} USDT\n"
+        f"💸 العمولات: {fmt4(trade.fees)} USDT\n"
+        f"✅ الصافي: {fmt4(trade.net_pnl)} USDT\n"
+        f"💼 الرصيد بعد الإغلاق: {fmt4(trade.balance_after)} USDT\n"
+        f"🧾 سبب الإغلاق: {trade.exit_reason}"
     )
-    send_telegram_message(session, text)
+    send_telegram_message(session, msg)
 
 
-def send_hourly_summary_ar(session: requests.Session, summary: HourlySummary) -> None:
-    text = (
-        "📊 ملخص الأداء (كل ساعة)\n"
-        f"إجمالي الربح/الخسارة منذ التشغيل: {summary.pnl_total:.4f} USDT\n"
-        f"الربح/الخسارة خلال آخر ساعة: {summary.pnl_last_hour:.4f} USDT\n"
-        f"عدد الصفقات: {summary.total_trades}\n"
-        f"الصفقات الرابحة: {summary.wins}\n"
-        f"الصفقات الخاسرة: {summary.losses}\n"
-        f"الرصيد الحالي: {summary.balance:.4f} USDT"
+def send_hourly_summary_ar(
+    session: requests.Session,
+    summary: HourlySummary,
+    open_position: Position | None,
+    unrealized_net: Decimal | None,
+) -> None:
+    if open_position is None:
+        pos_line = "🟢 حالة الصفقة الحالية: لا توجد صفقة مفتوحة"
+    else:
+        pos_line = (
+            "🟠 حالة الصفقة الحالية: "
+            f"{open_position.symbol} | {'شراء' if open_position.direction == 'LONG' else 'بيع'} "
+            f"| PnL غير محقق: {fmt4(unrealized_net or DEC_ZERO)} USDT"
+        )
+
+    msg = (
+        "📊 الملخص الساعي\n"
+        f"🕒 الوقت (القاهرة): {cairo_now_text()}\n"
+        f"ربح آخر ساعة: {fmt4(summary.profit_last_hour)} USDT\n"
+        f"خسارة آخر ساعة: {fmt4(summary.loss_last_hour)} USDT\n"
+        f"صافي آخر ساعة: {fmt4(summary.net_last_hour)} USDT\n"
+        f"إجمالي الربح منذ البداية: {fmt4(summary.profit_total)} USDT\n"
+        f"إجمالي الخسارة منذ البداية: {fmt4(summary.loss_total)} USDT\n"
+        f"صافي الإجمالي منذ البداية: {fmt4(summary.net_total)} USDT\n"
+        f"العمولات (آخر ساعة): {fmt4(summary.fees_last_hour)} USDT\n"
+        f"العمولات (إجمالي): {fmt4(summary.fees_total)} USDT\n"
+        f"عدد الصفقات: {summary.total_trades} | رابحة: {summary.wins} | خاسرة: {summary.losses} | نسبة النجاح: {fmt2(summary.win_rate)}%\n"
+        f"💼 الرصيد الحالي: {fmt4(summary.balance)} USDT\n"
+        f"{pos_line}"
     )
-    send_telegram_message(session, text)
+    send_telegram_message(session, msg)
 
 
-def build_hourly_summary(now_ms: int, trades: list[Trade], balance: float) -> HourlySummary:
-    pnl_total = sum(t.net_pnl for t in trades)
-    one_hour_ago = now_ms - 3600_000
-    pnl_last_hour = sum(t.net_pnl for t in trades if t.timestamp >= one_hour_ago)
-    wins = sum(1 for t in trades if t.net_pnl > 0)
-    losses = sum(1 for t in trades if t.net_pnl < 0)
+# -----------------------------
+# Summary / heartbeat
+# -----------------------------
+def build_hourly_summary(trades: list[Trade], balance: Decimal, ts_ms: int) -> HourlySummary:
+    one_hour_ago = ts_ms - 3_600_000
+
+    last_hour = [t for t in trades if t.timestamp >= one_hour_ago]
+
+    profit_last_hour = sum((t.net_pnl for t in last_hour if t.net_pnl > DEC_ZERO), DEC_ZERO)
+    loss_last_hour = sum((t.net_pnl for t in last_hour if t.net_pnl < DEC_ZERO), DEC_ZERO)
+    net_last_hour = profit_last_hour + loss_last_hour
+
+    profit_total = sum((t.net_pnl for t in trades if t.net_pnl > DEC_ZERO), DEC_ZERO)
+    loss_total = sum((t.net_pnl for t in trades if t.net_pnl < DEC_ZERO), DEC_ZERO)
+    net_total = profit_total + loss_total
+
+    fees_last_hour = sum((t.fees for t in last_hour), DEC_ZERO)
+    fees_total = sum((t.fees for t in trades), DEC_ZERO)
+
+    wins = sum(1 for t in trades if t.net_pnl > DEC_ZERO)
+    losses = sum(1 for t in trades if t.net_pnl < DEC_ZERO)
+    total = len(trades)
+    win_rate = (d(wins) / d(total) * d("100")) if total > 0 else DEC_ZERO
 
     return HourlySummary(
-        timestamp=now_ms,
-        pnl_total=pnl_total,
-        pnl_last_hour=pnl_last_hour,
-        total_trades=len(trades),
+        timestamp=ts_ms,
+        profit_last_hour=profit_last_hour,
+        loss_last_hour=loss_last_hour,
+        net_last_hour=net_last_hour,
+        profit_total=profit_total,
+        loss_total=loss_total,
+        net_total=net_total,
+        fees_last_hour=fees_last_hour,
+        fees_total=fees_total,
+        total_trades=total,
         wins=wins,
         losses=losses,
+        win_rate=win_rate,
         balance=balance,
     )
 
 
-def run_live_trader(session: requests.Session, cfg: Config) -> None:
+def heartbeat_log(
+    cfg: Config,
+    open_position: Position | None,
+    mark_price: Decimal | None,
+    bid: Decimal | None,
+    ask: Decimal | None,
+    unrealized_net: Decimal | None,
+    sleep_seconds: float,
+) -> None:
+    now_local = datetime.now(tz=CAIRO_TZ)
+    next_check = now_local.timestamp() + sleep_seconds
+    next_check_text = datetime.fromtimestamp(next_check, tz=CAIRO_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+    if open_position is None:
+        pos_text = "لا توجد صفقة مفتوحة"
+    else:
+        mid = ((bid + ask) / d("2")) if bid is not None and ask is not None else None
+        current = mark_price if mark_price is not None else mid
+        pos_text = (
+            f"صفقة مفتوحة: {open_position.symbol} | {'شراء' if open_position.direction == 'LONG' else 'بيع'} "
+            f"| دخول={fmt4(open_position.entry_fill_price)} "
+            f"| السعر الحالي={fmt4(current) if current is not None else 'N/A'} "
+            f"| PnL غير محقق={fmt4(unrealized_net or DEC_ZERO)} USDT"
+        )
+
+    logging.info(
+        "Heartbeat | القاهرة=%s | %s | النوم %.1f ثانية | الفحص القادم %s",
+        now_local.strftime("%Y-%m-%d %H:%M:%S"),
+        pos_text,
+        sleep_seconds,
+        next_check_text,
+    )
+
+
+# -----------------------------
+# Main live loop
+# -----------------------------
+def run_live_paper(session: requests.Session, cfg: Config) -> None:
     balance = cfg.initial_balance
     trades: list[Trade] = []
     open_position: Position | None = None
-    last_summary_sent = 0.0
-    loop_count = 0
 
     init_trade_csv(cfg.trades_csv)
     init_summary_csv(cfg.summary_csv)
 
+    # Align summary timer to wall-clock interval boundary
+    now_epoch = int(time.time())
+    next_summary_epoch = ((now_epoch // cfg.summary_interval_seconds) + 1) * cfg.summary_interval_seconds
+
+    loop_count = 0
+
     logging.info(
-        "Starting live loop | initial_balance=%.2f margin_per_trade=%.2f leverage=%.2fx fee=%.5f",
-        cfg.initial_balance,
-        cfg.margin_per_trade,
-        cfg.leverage,
-        cfg.fee_rate,
+        "Starting PAPER live loop | balance=%s | margin=%s | leverage=%s | notional=%s | fee_rate=%s",
+        fmt2(cfg.initial_balance),
+        fmt2(cfg.margin_per_trade),
+        fmt2(cfg.leverage),
+        fmt2(cfg.margin_per_trade * cfg.leverage),
+        str(cfg.fee_rate),
     )
 
     while True:
         loop_count += 1
         loop_start = time.time()
 
+        hb_bid: Decimal | None = None
+        hb_ask: Decimal | None = None
+        hb_mark: Decimal | None = None
+        hb_unrealized_net: Decimal | None = None
+
         try:
             top_symbols = fetch_top_symbols(session, cfg.top_n_symbols)
             logging.info("Top %d symbols by 24h quote volume: %s", cfg.top_n_symbols, ", ".join(top_symbols))
 
-            # 1) If there is an open position, monitor it first.
+            # 1) Manage open position first (single global position enforcement)
             if open_position is not None:
-                candles = fetch_klines(session, open_position.symbol, cfg.interval, cfg.candle_limit)
-                latest_candle = candles[-1]
-                trade, balance = evaluate_position_exit(open_position, latest_candle, cfg.fee_rate, balance)
-                if trade is not None:
+                bid, ask, _ = fetch_book_ticker(session, open_position.symbol)
+                hb_bid, hb_ask = bid, ask
+                hb_mark = fetch_mark_price(session, open_position.symbol)
+
+                trade, balance = evaluate_live_exit(open_position, bid, ask, cfg.fee_rate, balance)
+
+                # heartbeat unrealized when still open
+                if trade is None:
+                    _, hb_unrealized_net = estimate_unrealized(open_position, bid, ask, cfg.fee_rate)
+                else:
                     trades.append(trade)
                     append_trade_csv(cfg.trades_csv, trade)
                     logging.info(
-                        "Closed %s %s | entry=%.4f exit=%.4f gross=%.4f fee=%.4f net=%.4f balance=%.4f",
+                        "Closed %s %s | entry=%s exit=%s gross=%s fees=%s net=%s balance=%s reason=%s",
                         trade.symbol,
                         trade.direction,
-                        trade.entry_price,
-                        trade.exit_price,
-                        trade.gross_pnl,
-                        trade.fees,
-                        trade.net_pnl,
-                        trade.balance,
+                        fmt4(trade.entry_fill_price),
+                        fmt4(trade.exit_fill_price),
+                        fmt4(trade.gross_pnl),
+                        fmt4(trade.fees),
+                        fmt4(trade.net_pnl),
+                        fmt4(trade.balance_after),
+                        trade.exit_reason,
                     )
                     if cfg.send_telegram:
                         try:
-                            send_close_alert_ar(session, trade)
+                            send_exit_alert_ar(session, trade)
                         except Exception as exc:  # noqa: BLE001
-                            logging.error("Failed to send Arabic close alert: %s", exc)
+                            logging.error("Failed to send Telegram exit alert: %s", exc)
                     open_position = None
 
-            # 2) If no open position, scan top symbols for first valid opportunity.
-            if open_position is None:
-                for symbol in top_symbols:
-                    try:
-                        candles = fetch_klines(session, symbol, cfg.interval, cfg.candle_limit)
-                        spread = fetch_spread(session, symbol)
-                        signal, atr_value = generate_entry_signal(cfg, candles, spread)
+            # 2) If no position open, evaluate ALL top symbols and choose best score
+            can_open_more_by_count = cfg.max_total_trades is None or len(trades) < cfg.max_total_trades
+            if open_position is None and not can_open_more_by_count:
+                logging.info("Trade cap reached (max_total_trades=%s). New entries are disabled.", cfg.max_total_trades)
 
-                        if signal is None or atr_value is None:
-                            continue
+            if open_position is None and can_open_more_by_count:
+                if balance < cfg.margin_per_trade:
+                    logging.info(
+                        "Skipping entries: balance (%s) < margin_per_trade (%s)",
+                        fmt2(balance),
+                        fmt2(cfg.margin_per_trade),
+                    )
+                else:
+                    candidates: list[tuple[CandidateSignal, int]] = []
+                    for symbol in top_symbols:
+                        try:
+                            candles = fetch_klines(session, symbol, cfg.interval, cfg.candle_limit)
+                            bid, ask, spread = fetch_book_ticker(session, symbol)
+                            candidate = evaluate_candidate_signal(cfg, symbol, candles, bid, ask, spread)
+                            if candidate is not None:
+                                candidates.append((candidate, candles[-1].close_time))
+                                logging.info(
+                                    "Candidate %s | dir=%s score=%s vol_ratio=%s spread=%s atr=%s rsi=%s",
+                                    candidate.symbol,
+                                    candidate.direction,
+                                    fmt4(candidate.score),
+                                    fmt4(candidate.volume_ratio),
+                                    fmt4(candidate.spread),
+                                    fmt4(candidate.atr_value),
+                                    fmt4(candidate.rsi_value),
+                                )
+                        except Exception as exc:  # noqa: BLE001
+                            logging.warning("Signal scan failed for %s: %s", symbol, exc)
 
-                        pos = create_open_position(symbol, signal, atr_value, candles, cfg)
-                        if pos is None:
-                            continue
+                    if candidates:
+                        chosen, close_time = max(candidates, key=lambda x: x[0].score)
+                        position = create_position_from_candidate(cfg, chosen, close_time)
+                        if position is not None:
+                            open_position = position
+                            logging.info(
+                                "Chosen %s | dir=%s score=%s (vol_ratio=%s spread=%s atr=%s) | entry_fill=%s",
+                                chosen.symbol,
+                                chosen.direction,
+                                fmt4(chosen.score),
+                                fmt4(chosen.volume_ratio),
+                                fmt4(chosen.spread),
+                                fmt4(chosen.atr_value),
+                                fmt4(position.entry_fill_price),
+                            )
+                            if cfg.send_telegram:
+                                try:
+                                    send_entry_alert_ar(session, cfg, position, chosen)
+                                except Exception as exc:  # noqa: BLE001
+                                    logging.error("Failed to send Telegram entry alert: %s", exc)
+                    else:
+                        logging.info("No valid entry candidates this loop.")
 
-                        open_position = pos
-                        logging.info(
-                            "Opened %s %s | entry=%.4f qty=%.6f sl=%.4f tp=%.4f spread=%.5f",
-                            pos.symbol,
-                            pos.direction,
-                            pos.entry_price,
-                            pos.qty,
-                            pos.stop_loss,
-                            pos.take_profit,
-                            spread,
-                        )
-                        if cfg.send_telegram:
-                            try:
-                                send_entry_alert_ar(session, pos, cfg)
-                            except Exception as exc:  # noqa: BLE001
-                                logging.error("Failed to send Arabic entry alert: %s", exc)
-                        break  # strict single-position logic
-                    except Exception as exc:  # noqa: BLE001
-                        logging.warning("Signal evaluation failed for %s: %s", symbol, exc)
-
-            # 3) Hourly summary
-            now = time.time()
-            if (now - last_summary_sent) >= cfg.summary_interval_seconds:
-                now_ms = int(now * 1000)
-                summary = build_hourly_summary(now_ms, trades, balance)
+            # 3) Hourly summary (exactly at interval boundary or first pass after it)
+            now_epoch = int(time.time())
+            if now_epoch >= next_summary_epoch:
+                summary = build_hourly_summary(trades, balance, now_ms())
                 append_summary_csv(cfg.summary_csv, summary)
+
+                if open_position is not None:
+                    try:
+                        bid, ask, _ = fetch_book_ticker(session, open_position.symbol)
+                        _, hb_unrealized_net = estimate_unrealized(open_position, bid, ask, cfg.fee_rate)
+                        hb_bid, hb_ask = bid, ask
+                        hb_mark = fetch_mark_price(session, open_position.symbol)
+                    except Exception as exc:  # noqa: BLE001
+                        logging.warning("Could not refresh open-position metrics for summary: %s", exc)
+
                 logging.info(
-                    "Hourly summary | pnl_total=%.4f pnl_last_hour=%.4f trades=%d wins=%d losses=%d balance=%.4f",
-                    summary.pnl_total,
-                    summary.pnl_last_hour,
+                    "Hourly summary | net_last_hour=%s net_total=%s fees_hour=%s fees_total=%s trades=%d win_rate=%s%% balance=%s",
+                    fmt4(summary.net_last_hour),
+                    fmt4(summary.net_total),
+                    fmt4(summary.fees_last_hour),
+                    fmt4(summary.fees_total),
                     summary.total_trades,
-                    summary.wins,
-                    summary.losses,
-                    summary.balance,
+                    fmt2(summary.win_rate),
+                    fmt4(summary.balance),
                 )
+
                 if cfg.send_telegram:
                     try:
-                        send_hourly_summary_ar(session, summary)
+                        send_hourly_summary_ar(session, summary, open_position, hb_unrealized_net)
                     except Exception as exc:  # noqa: BLE001
-                        logging.error("Failed to send Arabic hourly summary: %s", exc)
-                last_summary_sent = now
+                        logging.error("Failed to send Telegram hourly summary: %s", exc)
+
+                while next_summary_epoch <= now_epoch:
+                    next_summary_epoch += cfg.summary_interval_seconds
 
         except Exception as exc:  # noqa: BLE001
             logging.error("Main loop error: %s", exc)
+
+        elapsed = time.time() - loop_start
+        sleep_seconds = max(1.0, cfg.loop_sleep_seconds - elapsed)
+
+        heartbeat_log(
+            cfg,
+            open_position,
+            hb_mark,
+            hb_bid,
+            hb_ask,
+            hb_unrealized_net,
+            sleep_seconds,
+        )
 
         if cfg.max_loops is not None and loop_count >= cfg.max_loops:
             logging.info("Reached max_loops=%d, exiting.", cfg.max_loops)
             break
 
-        elapsed = time.time() - loop_start
-        sleep_time = max(1.0, cfg.loop_sleep_seconds - elapsed)
-        time.sleep(sleep_time)
+        time.sleep(sleep_seconds)
 
 
 # -----------------------------
 # CLI
 # -----------------------------
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Live Binance futures trend-pullback trader with Arabic Telegram alerts")
-    parser.add_argument("--interval", type=str)
-    parser.add_argument("--candle-limit", type=int)
-    parser.add_argument("--top-n-symbols", type=int)
-    parser.add_argument("--fee-rate", type=float)
-    parser.add_argument("--leverage", type=float)
-    parser.add_argument("--margin-per-trade", type=float)
-    parser.add_argument("--max-spread", type=float)
-    parser.add_argument("--summary-interval-seconds", type=int)
-    parser.add_argument("--loop-sleep-seconds", type=int)
-    parser.add_argument("--no-telegram", action="store_true")
-    parser.add_argument("--max-loops", type=int, help="Optional testing cap for main loop iterations")
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description="Live Binance USD-M futures PAPER simulator with Arabic Telegram alerts")
+    p.add_argument("--interval", type=str)
+    p.add_argument("--candle-limit", type=int)
+    p.add_argument("--top-n-symbols", type=int)
+    p.add_argument("--fee-rate", type=str)
+    p.add_argument("--leverage", type=str)
+    p.add_argument("--margin-per-trade", type=str)
+    p.add_argument("--max-spread", type=str)
+    p.add_argument("--summary-interval-seconds", type=int)
+    p.add_argument("--loop-sleep-seconds", type=int)
+    p.add_argument("--max-total-trades", type=int)
+    p.add_argument("--no-telegram", action="store_true")
+    p.add_argument("--max-loops", type=int, help="testing helper")
+    return p.parse_args()
 
 
 def build_config(args: argparse.Namespace) -> Config:
@@ -893,17 +1165,19 @@ def build_config(args: argparse.Namespace) -> Config:
     if args.top_n_symbols is not None:
         cfg.top_n_symbols = args.top_n_symbols
     if args.fee_rate is not None:
-        cfg.fee_rate = args.fee_rate
+        cfg.fee_rate = d(args.fee_rate)
     if args.leverage is not None:
-        cfg.leverage = args.leverage
+        cfg.leverage = d(args.leverage)
     if args.margin_per_trade is not None:
-        cfg.margin_per_trade = args.margin_per_trade
+        cfg.margin_per_trade = d(args.margin_per_trade)
     if args.max_spread is not None:
-        cfg.max_spread = args.max_spread
+        cfg.max_spread = d(args.max_spread)
     if args.summary_interval_seconds is not None:
         cfg.summary_interval_seconds = args.summary_interval_seconds
     if args.loop_sleep_seconds is not None:
         cfg.loop_sleep_seconds = args.loop_sleep_seconds
+    if args.max_total_trades is not None:
+        cfg.max_total_trades = args.max_total_trades
     if args.max_loops is not None:
         cfg.max_loops = args.max_loops
     if args.no_telegram:
@@ -920,7 +1194,7 @@ def main() -> int:
     try:
         cfg = build_config(parse_args())
         with requests.Session() as session:
-            run_live_trader(session, cfg)
+            run_live_paper(session, cfg)
         return 0
     except Exception as exc:  # noqa: BLE001
         logging.error("Fatal error: %s", exc)
