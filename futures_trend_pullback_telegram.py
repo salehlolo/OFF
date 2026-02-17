@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import logging
 import os
 import random
@@ -144,6 +145,13 @@ class CandidateSignal:
     bid: Decimal
     ask: Decimal
 
+
+
+
+@dataclass
+class SignalCheck:
+    candidate: CandidateSignal | None
+    reject_reasons: list[str]
 
 @dataclass
 class Trade:
@@ -631,7 +639,7 @@ def append_summary_csv(path: str, summary: HourlySummary) -> None:
 # -----------------------------
 # Strategy evaluation
 # -----------------------------
-def evaluate_candidate_signal(cfg: Config, symbol: str, candles: list[Candle], bid: Decimal, ask: Decimal, spread: Decimal) -> CandidateSignal | None:
+def evaluate_candidate_signal(cfg: Config, symbol: str, candles: list[Candle], bid: Decimal, ask: Decimal, spread: Decimal) -> SignalCheck:
     closes = [float(c.close) for c in candles]
     volumes = [float(c.volume) for c in candles]
 
@@ -652,8 +660,10 @@ def evaluate_candidate_signal(cfg: Config, symbol: str, candles: list[Candle], b
     vma = vma_vals[i]
     prev_e20 = ema_fast_vals[i - 1]
 
+    reasons: list[str] = []
     if any(v is None for v in [e20, e50, r, a, vma, prev_e20]):
-        return None
+        reasons.append("indicator_not_ready")
+        return SignalCheck(candidate=None, reject_reasons=reasons)
 
     c_close = float(c.close)
     c_vol = float(c.volume)
@@ -661,8 +671,12 @@ def evaluate_candidate_signal(cfg: Config, symbol: str, candles: list[Candle], b
 
     volume_ok = c_vol > float(vma)
     spread_ok = spread <= cfg.max_spread
-    if not volume_ok or not spread_ok:
-        return None
+    if not volume_ok:
+        reasons.append(f"volume_filter_fail vol={c_vol:.4f} vma={float(vma):.4f}")
+    if not spread_ok:
+        reasons.append(f"spread_filter_fail spread={fmt4(spread)} max={fmt4(cfg.max_spread)}")
+    if reasons:
+        return SignalCheck(candidate=None, reject_reasons=reasons)
 
     long_trend = c_close > float(e50)
     short_trend = c_close < float(e50)
@@ -678,29 +692,38 @@ def evaluate_candidate_signal(cfg: Config, symbol: str, candles: list[Candle], b
         direction = "LONG"
     elif short_trend and short_trigger and short_rsi_ok:
         direction = "SHORT"
+
     if direction is None:
-        return None
+        if not long_trend and not short_trend:
+            reasons.append("trend_filter_fail")
+        if not long_trigger and not short_trigger:
+            reasons.append("pullback_trigger_fail")
+        if cfg.use_rsi_filter and not (long_rsi_ok or short_rsi_ok):
+            reasons.append(f"rsi_filter_fail rsi={fmt4(rsi_val)} threshold={fmt4(cfg.rsi_threshold)}")
+        return SignalCheck(candidate=None, reject_reasons=reasons or ["no_direction"])
 
     atr_val = d(a)
     if atr_val <= DEC_ZERO:
-        return None
+        return SignalCheck(candidate=None, reject_reasons=["atr_non_positive"])
 
     volume_ratio = d(c_vol) / d(vma)
     atr_pct = atr_val / c.close if c.close > DEC_ZERO else DEC_ZERO
     score = (volume_ratio / (spread + EPS)) * (DEC_ONE + atr_pct)
 
-    return CandidateSignal(
-        symbol=symbol,
-        direction=direction,
-        score=score,
-        spread=spread,
-        atr_value=atr_val,
-        volume_ratio=volume_ratio,
-        rsi_value=rsi_val,
-        bid=bid,
-        ask=ask,
+    return SignalCheck(
+        candidate=CandidateSignal(
+            symbol=symbol,
+            direction=direction,
+            score=score,
+            spread=spread,
+            atr_value=atr_val,
+            volume_ratio=volume_ratio,
+            rsi_value=rsi_val,
+            bid=bid,
+            ask=ask,
+        ),
+        reject_reasons=[],
     )
-
 
 def create_position_from_candidate(cfg: Config, candidate: CandidateSignal, latest_close_time: int) -> Position | None:
     entry_fill = candidate.ask if candidate.direction == "LONG" else candidate.bid
@@ -1039,7 +1062,8 @@ def run_live_paper(session: requests.Session, cfg: Config) -> None:
                         try:
                             candles = fetch_klines(session, symbol, cfg.interval, cfg.candle_limit)
                             bid, ask, spread = fetch_book_ticker(session, symbol)
-                            candidate = evaluate_candidate_signal(cfg, symbol, candles, bid, ask, spread)
+                            check = evaluate_candidate_signal(cfg, symbol, candles, bid, ask, spread)
+                            candidate = check.candidate
                             if candidate is not None:
                                 candidates.append((candidate, candles[-1].close_time))
                                 logging.info(
@@ -1052,6 +1076,8 @@ def run_live_paper(session: requests.Session, cfg: Config) -> None:
                                     fmt4(candidate.atr_value),
                                     fmt4(candidate.rsi_value),
                                 )
+                            else:
+                                logging.info("Rejected %s signal: %s", symbol, "; ".join(check.reject_reasons))
                         except Exception as exc:  # noqa: BLE001
                             logging.warning("Signal scan failed for %s: %s", symbol, exc)
 
@@ -1059,7 +1085,10 @@ def run_live_paper(session: requests.Session, cfg: Config) -> None:
                         chosen, close_time = max(candidates, key=lambda x: x[0].score)
                         position = create_position_from_candidate(cfg, chosen, close_time)
                         if position is not None:
-                            open_position = position
+                            if open_position is not None:
+                                logging.error("Single-position guard violated; refusing new entry on %s", chosen.symbol)
+                            else:
+                                open_position = position
                             logging.info(
                                 "Chosen %s | dir=%s score=%s (vol_ratio=%s spread=%s atr=%s) | entry_fill=%s",
                                 chosen.symbol,
@@ -1301,6 +1330,29 @@ def run_backtest_mode(session: requests.Session, cfg: Config, symbol: str, data_
     print(f"Net PnL: {fmt4(total_net)} USDT")
     print(f"Final balance: {fmt4(balance)} USDT")
 
+
+def write_runtime_system_report() -> None:
+    report = {
+        "single_position_enforced": True,
+        "defaults": {
+            "initial_balance": "100",
+            "margin_per_trade": "90",
+            "leverage": "3",
+            "fee_rate": "0.0004",
+            "top_n_symbols": 5,
+            "summary_interval_seconds": 3600,
+        },
+        "examples": {
+            "download": "python download_um_futures_klines.py --symbols BTCUSDT,ETHUSDT --intervals 15m,1h --start 2023-02-17 --end 2026-02-17 --out data/um_futures",
+            "backtest": "python futures_trend_pullback_telegram.py --mode backtest --symbol BTCUSDT --interval 1h --data-dir data/um_futures",
+            "live": "python futures_trend_pullback_telegram.py --mode live",
+        },
+    }
+    out = Path("runtime_system_report.json")
+    out.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    logging.info("Runtime system report saved: %s", out)
+
+
 # -----------------------------
 # CLI
 # -----------------------------
@@ -1363,6 +1415,7 @@ def main() -> int:
     try:
         args = parse_args()
         cfg = build_config(args)
+        write_runtime_system_report()
         with requests.Session() as session:
             if args.mode == "backtest":
                 run_backtest_mode(session, cfg, args.symbol.upper(), args.data_dir)
