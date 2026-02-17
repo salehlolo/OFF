@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP, getcontext
 from typing import Any
 from zoneinfo import ZoneInfo
+from pathlib import Path
 
 import requests
 from requests import Response
@@ -1135,11 +1136,179 @@ def run_live_paper(session: requests.Session, cfg: Config) -> None:
         time.sleep(sleep_seconds)
 
 
+
+
+# -----------------------------
+# Backtest data loaders
+# -----------------------------
+def load_local_klines(data_dir: str, symbol: str, interval: str) -> list[Candle]:
+    base = Path(data_dir) / "klines" / symbol / interval
+    parquet_path = base / "merged.parquet"
+    csv_path = base / "merged.csv"
+
+    rows: list[list[str]] = []
+    if parquet_path.exists():
+        try:
+            import pandas as pd  # type: ignore
+
+            df = pd.read_parquet(parquet_path)
+            rows = df.astype(str).values.tolist()
+        except Exception:
+            rows = []
+
+    if not rows:
+        if not csv_path.exists():
+            raise FileNotFoundError(f"Local merged data not found: {csv_path}")
+        with csv_path.open("r", newline="", encoding="utf-8") as f:
+            r = csv.reader(f)
+            next(r, None)
+            for row in r:
+                if len(row) >= 12:
+                    rows.append(row[:12])
+
+    candles: list[Candle] = []
+    for r in rows:
+        candles.append(
+            Candle(
+                open_time=int(r[0]),
+                open=d(r[1]),
+                high=d(r[2]),
+                low=d(r[3]),
+                close=d(r[4]),
+                volume=d(r[5]),
+                close_time=int(r[6]),
+            )
+        )
+    return candles
+
+
+def fetch_klines_rest_for_backtest(session: requests.Session, symbol: str, interval: str, limit: int = 1500) -> list[Candle]:
+    resp = request_with_retry(
+        session,
+        "GET",
+        f"{FUTURES_BASE}{KLINES_ENDPOINT}",
+        params={"symbol": symbol, "interval": interval, "limit": limit},
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Backtest klines fetch failed: HTTP {resp.status_code} - {resp.text}")
+    payload = resp.json()
+    if not isinstance(payload, list):
+        raise RuntimeError("Unexpected klines payload")
+    return [
+        Candle(
+            open_time=int(x[0]),
+            open=d(x[1]),
+            high=d(x[2]),
+            low=d(x[3]),
+            close=d(x[4]),
+            volume=d(x[5]),
+            close_time=int(x[6]),
+        )
+        for x in payload
+    ]
+
+
+def run_backtest_mode(session: requests.Session, cfg: Config, symbol: str, data_dir: str | None) -> None:
+    candles = load_local_klines(data_dir, symbol, cfg.interval) if data_dir else fetch_klines_rest_for_backtest(session, symbol, cfg.interval)
+    if len(candles) < 100:
+        raise RuntimeError("Not enough candles for backtest")
+
+    closes = [float(c.close) for c in candles]
+    volumes = [float(c.volume) for c in candles]
+    e20 = ema(closes, cfg.ema_fast)
+    e50 = ema(closes, cfg.ema_trend)
+    rsi_vals = rsi(closes, cfg.rsi_period)
+    atr_vals = atr(candles, cfg.atr_period)
+    vma = sma(volumes, cfg.volume_ma_period)
+
+    balance = cfg.initial_balance
+    pos: Position | None = None
+    trades: list[Trade] = []
+
+    for i in range(max(cfg.ema_trend, cfg.atr_period, cfg.volume_ma_period, cfg.rsi_period) + 1, len(candles)):
+        c = candles[i]
+        prev = candles[i - 1]
+
+        if pos is not None:
+            # candle-based conservative exit in backtest mode
+            if pos.direction == "LONG":
+                bid = c.low
+                ask = c.high
+            else:
+                bid = c.low
+                ask = c.high
+            trade, balance = evaluate_live_exit(pos, bid, ask, cfg.fee_rate, balance)
+            if trade is not None:
+                trades.append(trade)
+                pos = None
+
+        if pos is not None:
+            continue
+
+        if cfg.max_total_trades is not None and len(trades) >= cfg.max_total_trades:
+            continue
+
+        if balance < cfg.margin_per_trade:
+            continue
+
+        if any(x is None for x in [e20[i], e50[i], rsi_vals[i], atr_vals[i], vma[i], e20[i - 1]]):
+            continue
+
+        spread = DEC_ZERO
+        volume_ok = d(volumes[i]) > d(vma[i])
+        spread_ok = spread <= cfg.max_spread
+        if not volume_ok or not spread_ok:
+            continue
+
+        long_trend = closes[i] > float(e50[i])
+        short_trend = closes[i] < float(e50[i])
+        long_trigger = float(prev.close) <= float(e20[i - 1]) and closes[i] > float(e20[i])
+        short_trigger = float(prev.close) >= float(e20[i - 1]) and closes[i] < float(e20[i])
+
+        r = d(rsi_vals[i])
+        long_rsi_ok = (r > cfg.rsi_threshold) if cfg.use_rsi_filter else True
+        short_rsi_ok = (r < cfg.rsi_threshold) if cfg.use_rsi_filter else True
+
+        direction = None
+        if long_trend and long_trigger and long_rsi_ok:
+            direction = "LONG"
+        elif short_trend and short_trigger and short_rsi_ok:
+            direction = "SHORT"
+        if direction is None:
+            continue
+
+        atr_val = d(atr_vals[i])
+        cand = CandidateSignal(
+            symbol=symbol,
+            direction=direction,
+            score=d("1"),
+            spread=spread,
+            atr_value=atr_val,
+            volume_ratio=d(volumes[i]) / d(vma[i]),
+            rsi_value=r,
+            bid=c.close,
+            ask=c.close,
+        )
+        pos = create_position_from_candidate(cfg, cand, c.close_time)
+
+    total_net = sum((t.net_pnl for t in trades), DEC_ZERO)
+    wins = sum(1 for t in trades if t.net_pnl > DEC_ZERO)
+    print("=== Backtest Summary ===")
+    print(f"Symbol: {symbol}")
+    print(f"Interval: {cfg.interval}")
+    print(f"Trades: {len(trades)}")
+    print(f"Win rate: {(wins/len(trades)*100 if trades else 0):.2f}%")
+    print(f"Net PnL: {fmt4(total_net)} USDT")
+    print(f"Final balance: {fmt4(balance)} USDT")
+
 # -----------------------------
 # CLI
 # -----------------------------
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Live Binance USD-M futures PAPER simulator with Arabic Telegram alerts")
+    p = argparse.ArgumentParser(description="Live/Backtest Binance USD-M futures PAPER simulator with Arabic Telegram alerts")
+    p.add_argument("--mode", type=str, default="live", choices=["live", "backtest"])
+    p.add_argument("--symbol", type=str, default="BTCUSDT")
+    p.add_argument("--data-dir", type=str, help="Path like data/um_futures for local merged klines")
     p.add_argument("--interval", type=str)
     p.add_argument("--candle-limit", type=int)
     p.add_argument("--top-n-symbols", type=int)
@@ -1192,9 +1361,13 @@ def main() -> int:
     maybe_load_dotenv()
 
     try:
-        cfg = build_config(parse_args())
+        args = parse_args()
+        cfg = build_config(args)
         with requests.Session() as session:
-            run_live_paper(session, cfg)
+            if args.mode == "backtest":
+                run_backtest_mode(session, cfg, args.symbol.upper(), args.data_dir)
+            else:
+                run_live_paper(session, cfg)
         return 0
     except Exception as exc:  # noqa: BLE001
         logging.error("Fatal error: %s", exc)
