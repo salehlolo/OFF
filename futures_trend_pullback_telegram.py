@@ -1,26 +1,22 @@
 #!/usr/bin/env python3
 """
-Unified Binance Futures Trend-Pullback Backtester + Telegram Notifier
-=====================================================================
+Live Binance USD-M Futures Trend-Pullback PAPER Simulator
+=========================================================
 
-This is a paper-trading/backtesting script (NO live order placement).
-It combines:
-1) Futures data acquisition from Binance REST API
-2) Trend Pullback strategy simulation
-3) Fee-aware PnL/accounting + CSV trade logs
-4) Telegram notifications per closed trade + final summary
+- Continuous live market scanner (Top 5 USDT perpetual symbols by 24h quote volume).
+- Strict global single-position mode (one open position at any moment).
+- PAPER only (no real order placement).
 
-Major defaults preserved from previous scripts:
-- Symbol: BTCUSDT
-- Interval: 1h
-- EMA fast/trend: 20 / 50
-- RSI: 14 (optional filter, enabled by default)
-- ATR: 14
-- Volume MA: 20
-- ATR stop/take-profit: 1x ATR / 1.5x ATR
-- Initial balance: 100 USD
-- Trade allocation: 90 USD per trade
-- Commission: 0.04% per side (fee_rate=0.0004)
+How to run
+----------
+1) Default run:
+   python futures_trend_pullback_telegram.py
+
+2) Faster loop checks (for monitoring/testing):
+   python futures_trend_pullback_telegram.py --loop-sleep-seconds 15
+
+3) Allow only one closed trade then stop opening new trades:
+   python futures_trend_pullback_telegram.py --max-total-trades 1
 """
 
 from __future__ import annotations
@@ -34,31 +30,43 @@ import random
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP, getcontext
 from typing import Any
+from zoneinfo import ZoneInfo
+from pathlib import Path
 
 import requests
 from requests import Response
 from requests.exceptions import RequestException, Timeout
 
-# Optional local .env support
 try:
     from dotenv import load_dotenv
 except ImportError:  # pragma: no cover
     load_dotenv = None
 
+# Decimal precision for financial calculations
+getcontext().prec = 28
+
 # -----------------------------
-# API constants and HTTP policy
+# Binance API constants
 # -----------------------------
 FUTURES_BASE = "https://fapi.binance.com"
 KLINES_ENDPOINT = "/fapi/v1/klines"
 BOOK_TICKER_ENDPOINT = "/fapi/v1/ticker/bookTicker"
+TICKER_24HR_ENDPOINT = "/fapi/v1/ticker/24hr"
+PREMIUM_INDEX_ENDPOINT = "/fapi/v1/premiumIndex"
 
 TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
-REQUEST_TIMEOUT = (5, 15)  # connect, read
+REQUEST_TIMEOUT = (5, 20)
 MAX_RETRIES = 5
 INITIAL_BACKOFF = 1.0
 MAX_BACKOFF = 20.0
 JITTER_MAX = 0.5
+
+CAIRO_TZ = ZoneInfo("Africa/Cairo")
+DEC_ZERO = Decimal("0")
+DEC_ONE = Decimal("1")
+EPS = Decimal("1e-9")
 
 
 # -----------------------------
@@ -66,73 +74,149 @@ JITTER_MAX = 0.5
 # -----------------------------
 @dataclass
 class Config:
-    # Market/data
-    symbol: str = "BTCUSDT"
-    interval: str = "1h"
-    limit: int = 500
-    start_time_ms: int | None = None
-    end_time_ms: int | None = None
+    interval: str = "1m"
+    candle_limit: int = 150
+    top_n_symbols: int = 5
 
-    # Strategy defaults (preserved)
     ema_fast: int = 20
     ema_trend: int = 50
     rsi_period: int = 14
     atr_period: int = 14
     volume_ma_period: int = 20
+
     use_rsi_filter: bool = True
-    rsi_threshold: float = 50.0
-    max_spread: float = 2.0
+    rsi_threshold: Decimal = Decimal("50")
+    max_spread: Decimal = Decimal("0.1")
 
-    # Exits
-    atr_sl_mult: float = 1.0
-    rr_ratio: float = 1.5
-    use_trailing_stop: bool = False
-    trailing_atr_mult: float = 1.0
+    atr_sl_mult: Decimal = Decimal("1")
+    rr_ratio: Decimal = Decimal("1.5")
 
-    # Account/risk
-    initial_balance: float = 100.0
-    trade_size_usd: float = 90.0
-    fee_rate: float = 0.0004  # 0.04% per side
-    max_concurrent_positions: int = 1
+    initial_balance: Decimal = Decimal("100")
+    margin_per_trade: Decimal = Decimal("90")
+    leverage: Decimal = Decimal("3")
+    fee_rate: Decimal = Decimal("0.0004")
 
-    # Output/notifications
-    output_csv: str = "backtest_results.csv"
+    loop_sleep_seconds: int = 60
+    summary_interval_seconds: int = 3600
+
     send_telegram: bool = True
+    trades_csv: str = "backtest_results.csv"
+    summary_csv: str = "hourly_summary.csv"
+
+    max_loops: int | None = None
+    max_total_trades: int | None = None
 
 
 @dataclass
 class Candle:
     open_time: int
-    open: float
-    high: float
-    low: float
-    close: float
-    volume: float
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: Decimal
     close_time: int
 
 
 @dataclass
 class Position:
+    symbol: str
     direction: str  # LONG | SHORT
     entry_time: int
-    entry_price: float
-    qty: float
-    stop_loss: float
-    take_profit: float
+    entry_fill_price: Decimal
+    qty: Decimal
+    stop_loss: Decimal
+    take_profit: Decimal
+    entry_notional: Decimal
+    entry_spread: Decimal
+    volume_ratio: Decimal
+    rsi_value: Decimal
 
+
+@dataclass
+class CandidateSignal:
+    symbol: str
+    direction: str
+    score: Decimal
+    spread: Decimal
+    atr_value: Decimal
+    volume_ratio: Decimal
+    rsi_value: Decimal
+    bid: Decimal
+    ask: Decimal
+
+
+
+
+@dataclass
+class SignalCheck:
+    candidate: CandidateSignal | None
+    reject_reasons: list[str]
 
 @dataclass
 class Trade:
     timestamp: int
-    entry_price: float
-    exit_price: float
-    position_size: float
+    symbol: str
     direction: str
-    gross_pnl: float
-    fees: float
-    net_pnl: float
-    balance: float
+    entry_fill_price: Decimal
+    exit_fill_price: Decimal
+    quantity: Decimal
+    entry_notional: Decimal
+    exit_notional: Decimal
+    gross_pnl: Decimal
+    fees: Decimal
+    net_pnl: Decimal
+    balance_after: Decimal
     exit_reason: str
+
+
+@dataclass
+class HourlySummary:
+    timestamp: int
+    profit_last_hour: Decimal
+    loss_last_hour: Decimal
+    net_last_hour: Decimal
+    profit_total: Decimal
+    loss_total: Decimal
+    net_total: Decimal
+    fees_last_hour: Decimal
+    fees_total: Decimal
+    total_trades: int
+    wins: int
+    losses: int
+    win_rate: Decimal
+    balance: Decimal
+
+
+# -----------------------------
+# Utility
+# -----------------------------
+def d(raw: Any) -> Decimal:
+    return Decimal(str(raw))
+
+
+def fmt2(val: Decimal) -> str:
+    return str(val.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def fmt4(val: Decimal) -> str:
+    return str(val.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP))
+
+
+def fmt6(val: Decimal) -> str:
+    return str(val.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP))
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def cairo_now_text() -> str:
+    return datetime.now(tz=CAIRO_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def ms_to_cairo_text(ts_ms: int) -> str:
+    return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).astimezone(CAIRO_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 # -----------------------------
@@ -148,7 +232,7 @@ def setup_logging() -> None:
 
 def maybe_load_dotenv() -> None:
     if load_dotenv is None:
-        logging.info("python-dotenv not installed; skipping .env loading.")
+        logging.info("python-dotenv not installed; skipping .env loading")
         return
     if load_dotenv():
         logging.info("Loaded environment variables from .env")
@@ -160,9 +244,9 @@ def parse_bool(raw: str | None, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def env_float(name: str, default: float) -> float:
+def env_decimal(name: str, default: str) -> Decimal:
     raw = os.getenv(name)
-    return float(raw) if raw and raw.strip() else default
+    return d(raw) if raw and raw.strip() else d(default)
 
 
 def env_int(name: str, default: int) -> int:
@@ -170,79 +254,72 @@ def env_int(name: str, default: int) -> int:
     return int(raw) if raw and raw.strip() else default
 
 
-def load_env_config() -> Config:
+def load_config_from_env() -> Config:
+    max_total_trades_raw = os.getenv("MAX_TOTAL_TRADES")
+    max_total_trades = int(max_total_trades_raw) if max_total_trades_raw and max_total_trades_raw.strip() else None
+
     return Config(
-        symbol=os.getenv("SYMBOL", "BTCUSDT"),
-        interval=os.getenv("INTERVAL", "1h"),
-        limit=env_int("LIMIT", 500),
-        start_time_ms=int(os.getenv("START_TIME_MS")) if os.getenv("START_TIME_MS") else None,
-        end_time_ms=int(os.getenv("END_TIME_MS")) if os.getenv("END_TIME_MS") else None,
+        interval=os.getenv("INTERVAL", "1m"),
+        candle_limit=env_int("CANDLE_LIMIT", 150),
+        top_n_symbols=env_int("TOP_N_SYMBOLS", 5),
         ema_fast=env_int("EMA_FAST", 20),
         ema_trend=env_int("EMA_TREND", 50),
         rsi_period=env_int("RSI_PERIOD", 14),
         atr_period=env_int("ATR_PERIOD", 14),
         volume_ma_period=env_int("VOLUME_MA_PERIOD", 20),
         use_rsi_filter=parse_bool(os.getenv("USE_RSI_FILTER"), True),
-        rsi_threshold=env_float("RSI_THRESHOLD", 50.0),
-        max_spread=env_float("MAX_SPREAD", 2.0),
-        atr_sl_mult=env_float("ATR_SL_MULT", 1.0),
-        rr_ratio=env_float("RR_RATIO", 1.5),
-        use_trailing_stop=parse_bool(os.getenv("USE_TRAILING_STOP"), False),
-        trailing_atr_mult=env_float("TRAILING_ATR_MULT", 1.0),
-        initial_balance=env_float("INITIAL_BALANCE", 100.0),
-        trade_size_usd=env_float("TRADE_SIZE_USD", 90.0),
-        fee_rate=env_float("FEE_RATE", 0.0004),
-        max_concurrent_positions=env_int("MAX_CONCURRENT_POSITIONS", 1),
-        output_csv=os.getenv("OUTPUT_CSV", "backtest_results.csv"),
+        rsi_threshold=env_decimal("RSI_THRESHOLD", "50"),
+        max_spread=env_decimal("MAX_SPREAD", "0.1"),
+        atr_sl_mult=env_decimal("ATR_SL_MULT", "1"),
+        rr_ratio=env_decimal("RR_RATIO", "1.5"),
+        initial_balance=env_decimal("INITIAL_BALANCE", "100"),
+        margin_per_trade=env_decimal("MARGIN_PER_TRADE", "90"),
+        leverage=env_decimal("LEVERAGE", "3"),
+        fee_rate=env_decimal("FEE_RATE", "0.0004"),
+        loop_sleep_seconds=env_int("LOOP_SLEEP_SECONDS", 60),
+        summary_interval_seconds=env_int("SUMMARY_INTERVAL_SECONDS", 3600),
         send_telegram=parse_bool(os.getenv("SEND_TELEGRAM"), True),
+        trades_csv=os.getenv("TRADES_CSV", "backtest_results.csv"),
+        summary_csv=os.getenv("SUMMARY_CSV", "hourly_summary.csv"),
+        max_total_trades=max_total_trades,
     )
 
 
-def load_json_config(path: str) -> dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        payload = json.load(f)
-    if not isinstance(payload, dict):
-        raise ValueError("JSON config must be an object")
-    return payload
-
-
-def merge_config(base: Config, updates: dict[str, Any]) -> Config:
-    allowed = set(Config.__dataclass_fields__.keys())
-    for key in updates:
-        if key not in allowed:
-            raise ValueError(f"Unknown config key: {key}")
-    return Config(**{**base.__dict__, **updates})
-
-
 def validate_config(cfg: Config) -> None:
-    if cfg.limit < 120:
-        raise ValueError("limit must be >= 120")
-    if cfg.initial_balance <= 0:
-        raise ValueError("initial_balance must be > 0")
-    if cfg.trade_size_usd <= 0:
-        raise ValueError("trade_size_usd must be > 0")
-    if cfg.fee_rate < 0:
-        raise ValueError("fee_rate must be >= 0")
-    if cfg.max_concurrent_positions <= 0:
-        raise ValueError("max_concurrent_positions must be > 0")
+    if cfg.top_n_symbols <= 0:
+        raise ValueError("top_n_symbols must be > 0")
+    if cfg.candle_limit < 100:
+        raise ValueError("candle_limit must be >= 100")
     if cfg.ema_fast <= 1 or cfg.ema_trend <= 1 or cfg.ema_fast >= cfg.ema_trend:
-        raise ValueError("EMA settings invalid")
+        raise ValueError("Invalid EMA settings")
     if cfg.rsi_period <= 1 or cfg.atr_period <= 1 or cfg.volume_ma_period <= 1:
         raise ValueError("Indicator periods must be > 1")
-    if cfg.max_spread < 0:
+    if cfg.max_spread < DEC_ZERO:
         raise ValueError("max_spread must be >= 0")
-    if cfg.atr_sl_mult <= 0 or cfg.rr_ratio <= 0:
-        raise ValueError("atr_sl_mult and rr_ratio must be > 0")
-    if cfg.use_trailing_stop and cfg.trailing_atr_mult <= 0:
-        raise ValueError("trailing_atr_mult must be > 0 when trailing stop enabled")
+    if cfg.atr_sl_mult <= DEC_ZERO or cfg.rr_ratio <= DEC_ZERO:
+        raise ValueError("ATR multipliers must be > 0")
+    if cfg.initial_balance <= DEC_ZERO:
+        raise ValueError("initial_balance must be > 0")
+    if cfg.margin_per_trade <= DEC_ZERO:
+        raise ValueError("margin_per_trade must be > 0")
+    if cfg.leverage <= DEC_ZERO:
+        raise ValueError("leverage must be > 0")
+    if cfg.fee_rate < DEC_ZERO:
+        raise ValueError("fee_rate must be >= 0")
+    if cfg.loop_sleep_seconds <= 0:
+        raise ValueError("loop_sleep_seconds must be > 0")
+    if cfg.summary_interval_seconds <= 0:
+        raise ValueError("summary_interval_seconds must be > 0")
+    if cfg.max_total_trades is not None and cfg.max_total_trades < 0:
+        raise ValueError("max_total_trades must be >= 0")
 
 
 # -----------------------------
-# HTTP / API
+# HTTP
 # -----------------------------
 def sleep_backoff(attempt: int) -> None:
     delay = min(INITIAL_BACKOFF * (2 ** (attempt - 1)), MAX_BACKOFF) + random.uniform(0, JITTER_MAX)
-    logging.info("Retrying in %.2f sec", delay)
+    logging.info("Retrying in %.2f seconds", delay)
     time.sleep(delay)
 
 
@@ -257,101 +334,111 @@ def request_with_retry(
     last_exc: Exception | None = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            logging.info("HTTP %s %s params=%s", method, url, params)
-            resp = session.request(method=method, url=url, params=params, json=json_payload, timeout=REQUEST_TIMEOUT)
-            if resp.status_code in TRANSIENT_STATUSES:
-                logging.warning(
-                    "Transient HTTP %s for %s (attempt %d/%d)",
-                    resp.status_code,
-                    url,
-                    attempt,
-                    MAX_RETRIES,
-                )
-                if attempt == MAX_RETRIES:
-                    return resp
+            response = session.request(
+                method=method,
+                url=url,
+                params=params,
+                json=json_payload,
+                timeout=REQUEST_TIMEOUT,
+            )
+            if response.status_code in TRANSIENT_STATUSES and attempt < MAX_RETRIES:
+                logging.warning("Transient HTTP %s for %s (attempt %d/%d)", response.status_code, url, attempt, MAX_RETRIES)
                 sleep_backoff(attempt)
                 continue
-            return resp
+            return response
         except (Timeout, RequestException) as exc:
             last_exc = exc
-            logging.warning("Request error for %s (attempt %d/%d): %s", url, attempt, MAX_RETRIES, exc)
-            if attempt == MAX_RETRIES:
-                break
-            sleep_backoff(attempt)
+            logging.warning("Request failed for %s (attempt %d/%d): %s", url, attempt, MAX_RETRIES, exc)
+            if attempt < MAX_RETRIES:
+                sleep_backoff(attempt)
+                continue
     raise RuntimeError(f"Request failed after {MAX_RETRIES} attempts: {url}") from last_exc
 
 
-def fetch_klines(session: requests.Session, cfg: Config) -> list[Candle]:
-    """Fetch historical futures candlesticks from /fapi/v1/klines."""
+# -----------------------------
+# Binance data
+# -----------------------------
+def fetch_top_symbols(session: requests.Session, top_n: int) -> list[str]:
+    url = FUTURES_BASE + TICKER_24HR_ENDPOINT
+    resp = request_with_retry(session, "GET", url)
+    if resp.status_code != 200:
+        raise RuntimeError(f"24hr ticker failed: HTTP {resp.status_code} - {resp.text}")
+
+    payload = resp.json()
+    if not isinstance(payload, list):
+        raise RuntimeError("Unexpected /ticker/24hr payload")
+
+    candidates: list[tuple[str, Decimal]] = []
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        symbol = str(row.get("symbol", ""))
+        if not symbol.endswith("USDT") or "_" in symbol:
+            continue
+        try:
+            qv = d(row.get("quoteVolume", "0"))
+        except Exception:
+            continue
+        candidates.append((symbol, qv))
+
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    return [s for s, _ in candidates[:top_n]]
+
+
+def fetch_klines(session: requests.Session, symbol: str, interval: str, limit: int) -> list[Candle]:
     url = FUTURES_BASE + KLINES_ENDPOINT
-    candles: list[Candle] = []
-    remaining = cfg.limit
-    start = cfg.start_time_ms
+    resp = request_with_retry(session, "GET", url, params={"symbol": symbol, "interval": interval, "limit": limit})
+    if resp.status_code != 200:
+        raise RuntimeError(f"Klines failed for {symbol}: HTTP {resp.status_code} - {resp.text}")
 
-    while remaining > 0:
-        chunk = min(remaining, 1000)
-        params: dict[str, Any] = {"symbol": cfg.symbol, "interval": cfg.interval, "limit": chunk}
-        if start is not None:
-            params["startTime"] = start
-        if cfg.end_time_ms is not None:
-            params["endTime"] = cfg.end_time_ms
+    payload = resp.json()
+    if not isinstance(payload, list) or not payload:
+        raise RuntimeError(f"Invalid klines payload for {symbol}")
 
-        resp = request_with_retry(session, "GET", url, params=params)
-        if resp.status_code != 200:
-            raise RuntimeError(f"Klines request failed: HTTP {resp.status_code} - {resp.text}")
-
-        payload = resp.json()
-        if not isinstance(payload, list):
-            raise RuntimeError("Invalid kline payload format")
-        if not payload:
-            break
-
-        parsed = [
-            Candle(
-                open_time=int(x[0]),
-                open=float(x[1]),
-                high=float(x[2]),
-                low=float(x[3]),
-                close=float(x[4]),
-                volume=float(x[5]),
-                close_time=int(x[6]),
-            )
-            for x in payload
-        ]
-
-        candles.extend(parsed)
-        remaining = cfg.limit - len(candles)
-        if len(parsed) < chunk:
-            break
-        start = parsed[-1].close_time + 1
-
-    if not candles:
-        raise RuntimeError("No futures candles returned")
-    logging.info("Fetched %d futures candles", len(candles))
-    return candles[: cfg.limit]
+    return [
+        Candle(
+            open_time=int(x[0]),
+            open=d(x[1]),
+            high=d(x[2]),
+            low=d(x[3]),
+            close=d(x[4]),
+            volume=d(x[5]),
+            close_time=int(x[6]),
+        )
+        for x in payload
+    ]
 
 
-def fetch_spread(session: requests.Session, symbol: str) -> float:
-    """Fetch current futures spread from /fapi/v1/ticker/bookTicker."""
+def fetch_book_ticker(session: requests.Session, symbol: str) -> tuple[Decimal, Decimal, Decimal]:
     url = FUTURES_BASE + BOOK_TICKER_ENDPOINT
     resp = request_with_retry(session, "GET", url, params={"symbol": symbol})
     if resp.status_code != 200:
-        raise RuntimeError(f"BookTicker request failed: HTTP {resp.status_code} - {resp.text}")
-
+        raise RuntimeError(f"BookTicker failed for {symbol}: HTTP {resp.status_code} - {resp.text}")
     payload = resp.json()
     if not isinstance(payload, dict):
-        raise RuntimeError("Invalid bookTicker payload")
+        raise RuntimeError(f"Invalid bookTicker payload for {symbol}")
 
-    bid = float(payload["bidPrice"])
-    ask = float(payload["askPrice"])
+    bid = d(payload["bidPrice"])
+    ask = d(payload["askPrice"])
     spread = ask - bid
-    if spread < 0:
-        raise RuntimeError(f"Invalid negative spread: {spread}")
-    return spread
+    if spread < DEC_ZERO:
+        raise RuntimeError(f"Negative spread for {symbol}")
+    return bid, ask, spread
+
+
+def fetch_mark_price(session: requests.Session, symbol: str) -> Decimal | None:
+    url = FUTURES_BASE + PREMIUM_INDEX_ENDPOINT
+    resp = request_with_retry(session, "GET", url, params={"symbol": symbol})
+    if resp.status_code != 200:
+        return None
+    payload = resp.json()
+    if not isinstance(payload, dict) or "markPrice" not in payload:
+        return None
+    return d(payload["markPrice"])
 
 
 # -----------------------------
-# Indicators
+# Indicators (float math)
 # -----------------------------
 def ema(values: list[float], period: int) -> list[float | None]:
     out: list[float | None] = [None] * len(values)
@@ -386,9 +473,9 @@ def rsi(values: list[float], period: int) -> list[float | None]:
     gains: list[float] = []
     losses: list[float] = []
     for i in range(1, period + 1):
-        d = values[i] - values[i - 1]
-        gains.append(max(d, 0.0))
-        losses.append(max(-d, 0.0))
+        delta = values[i] - values[i - 1]
+        gains.append(max(delta, 0.0))
+        losses.append(max(-delta, 0.0))
 
     avg_gain = sum(gains) / period
     avg_loss = sum(losses) / period
@@ -402,9 +489,9 @@ def rsi(values: list[float], period: int) -> list[float | None]:
     out[period] = calc(avg_gain, avg_loss)
 
     for i in range(period + 1, len(values)):
-        d = values[i] - values[i - 1]
-        gain = max(d, 0.0)
-        loss = max(-d, 0.0)
+        delta = values[i] - values[i - 1]
+        gain = max(delta, 0.0)
+        loss = max(-delta, 0.0)
         avg_gain = ((avg_gain * (period - 1)) + gain) / period
         avg_loss = ((avg_loss * (period - 1)) + loss) / period
         out[i] = calc(avg_gain, avg_loss)
@@ -417,26 +504,27 @@ def atr(candles: list[Candle], period: int) -> list[float | None]:
     if len(candles) <= period:
         return out
 
-    trs: list[float] = []
-    for i, c in enumerate(candles):
+    tr_values: list[float] = []
+    for i, candle in enumerate(candles):
+        h, l = float(candle.high), float(candle.low)
         if i == 0:
-            tr = c.high - c.low
+            tr = h - l
         else:
-            prev_close = candles[i - 1].close
-            tr = max(c.high - c.low, abs(c.high - prev_close), abs(c.low - prev_close))
-        trs.append(tr)
+            prev_close = float(candles[i - 1].close)
+            tr = max(h - l, abs(h - prev_close), abs(l - prev_close))
+        tr_values.append(tr)
 
-    prev = sum(trs[1 : period + 1]) / period
-    out[period] = prev
+    prev_atr = sum(tr_values[1 : period + 1]) / period
+    out[period] = prev_atr
     for i in range(period + 1, len(candles)):
-        prev = ((prev * (period - 1)) + trs[i]) / period
-        out[i] = prev
+        prev_atr = ((prev_atr * (period - 1)) + tr_values[i]) / period
+        out[i] = prev_atr
 
     return out
 
 
 # -----------------------------
-# Telegram + utility helpers
+# Telegram & CSV
 # -----------------------------
 def telegram_credentials() -> tuple[str, str]:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -452,353 +540,867 @@ def send_telegram_message(session: requests.Session, text: str) -> None:
     resp = request_with_retry(session, "POST", url, json_payload={"chat_id": chat_id, "text": text})
     if resp.status_code != 200:
         raise RuntimeError(f"Telegram sendMessage failed: HTTP {resp.status_code} - {resp.text}")
-    payload = resp.json()
-    if not isinstance(payload, dict) or payload.get("ok") is not True:
-        raise RuntimeError(f"Telegram API error payload: {payload}")
 
 
-def fmt_ts(ms: int) -> str:
-    return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-
-def max_drawdown(equity: list[float]) -> float:
-    if not equity:
-        return 0.0
-    peak = equity[0]
-    max_dd = 0.0
-    for v in equity:
-        peak = max(peak, v)
-        dd = (peak - v) / peak if peak > 0 else 0.0
-        max_dd = max(max_dd, dd)
-    return max_dd
-
-
-def write_trades_csv(path: str, trades: list[Trade]) -> None:
+def init_trade_csv(path: str) -> None:
+    if os.path.exists(path):
+        return
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(
             [
-                "timestamp",
-                "entry_price",
-                "exit_price",
-                "position_size",
-                "trade_direction",
-                "gross_profit_loss",
+                "timestamp_cairo",
+                "symbol",
+                "direction",
+                "entry_fill_price",
+                "exit_fill_price",
+                "quantity",
+                "entry_notional",
+                "exit_notional",
+                "gross_pnl",
                 "fees",
-                "net_profit_loss",
-                "account_balance",
+                "net_pnl",
+                "balance_after",
                 "exit_reason",
             ]
         )
-        for t in trades:
-            w.writerow(
-                [
-                    fmt_ts(t.timestamp),
-                    f"{t.entry_price:.8f}",
-                    f"{t.exit_price:.8f}",
-                    f"{t.position_size:.8f}",
-                    t.direction,
-                    f"{t.gross_pnl:.8f}",
-                    f"{t.fees:.8f}",
-                    f"{t.net_pnl:.8f}",
-                    f"{t.balance:.8f}",
-                    t.exit_reason,
-                ]
-            )
+
+
+def append_trade_csv(path: str, trade: Trade) -> None:
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(
+            [
+                ms_to_cairo_text(trade.timestamp),
+                trade.symbol,
+                trade.direction,
+                fmt6(trade.entry_fill_price),
+                fmt6(trade.exit_fill_price),
+                fmt6(trade.quantity),
+                fmt6(trade.entry_notional),
+                fmt6(trade.exit_notional),
+                fmt6(trade.gross_pnl),
+                fmt6(trade.fees),
+                fmt6(trade.net_pnl),
+                fmt6(trade.balance_after),
+                trade.exit_reason,
+            ]
+        )
+
+
+def init_summary_csv(path: str) -> None:
+    if os.path.exists(path):
+        return
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(
+            [
+                "timestamp_cairo",
+                "profit_last_hour",
+                "loss_last_hour",
+                "net_last_hour",
+                "profit_total",
+                "loss_total",
+                "net_total",
+                "fees_last_hour",
+                "fees_total",
+                "total_trades",
+                "wins",
+                "losses",
+                "win_rate_pct",
+                "balance",
+            ]
+        )
+
+
+def append_summary_csv(path: str, summary: HourlySummary) -> None:
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(
+            [
+                ms_to_cairo_text(summary.timestamp),
+                fmt6(summary.profit_last_hour),
+                fmt6(summary.loss_last_hour),
+                fmt6(summary.net_last_hour),
+                fmt6(summary.profit_total),
+                fmt6(summary.loss_total),
+                fmt6(summary.net_total),
+                fmt6(summary.fees_last_hour),
+                fmt6(summary.fees_total),
+                summary.total_trades,
+                summary.wins,
+                summary.losses,
+                fmt4(summary.win_rate),
+                fmt6(summary.balance),
+            ]
+        )
 
 
 # -----------------------------
-# Backtest core logic
+# Strategy evaluation
 # -----------------------------
-def evaluate_exit(position: Position, candle: Candle, fee_rate: float, balance: float) -> tuple[Trade | None, float]:
-    exit_price = None
-    reason = ""
+def evaluate_candidate_signal(cfg: Config, symbol: str, candles: list[Candle], bid: Decimal, ask: Decimal, spread: Decimal) -> SignalCheck:
+    closes = [float(c.close) for c in candles]
+    volumes = [float(c.volume) for c in candles]
 
-    if position.direction == "LONG":
-        sl_hit = candle.low <= position.stop_loss
-        tp_hit = candle.high >= position.take_profit
-        if sl_hit and tp_hit:
-            exit_price, reason = position.stop_loss, "SL_and_TP_same_candle_assume_SL"
-        elif sl_hit:
-            exit_price, reason = position.stop_loss, "SL"
-        elif tp_hit:
-            exit_price, reason = position.take_profit, "TP"
+    ema_fast_vals = ema(closes, cfg.ema_fast)
+    ema_trend_vals = ema(closes, cfg.ema_trend)
+    rsi_vals = rsi(closes, cfg.rsi_period)
+    atr_vals = atr(candles, cfg.atr_period)
+    vma_vals = sma(volumes, cfg.volume_ma_period)
+
+    i = len(candles) - 1
+    c = candles[i]
+    prev = candles[i - 1]
+
+    e20 = ema_fast_vals[i]
+    e50 = ema_trend_vals[i]
+    r = rsi_vals[i]
+    a = atr_vals[i]
+    vma = vma_vals[i]
+    prev_e20 = ema_fast_vals[i - 1]
+
+    reasons: list[str] = []
+    if any(v is None for v in [e20, e50, r, a, vma, prev_e20]):
+        reasons.append("indicator_not_ready")
+        return SignalCheck(candidate=None, reject_reasons=reasons)
+
+    c_close = float(c.close)
+    c_vol = float(c.volume)
+    prev_close = float(prev.close)
+
+    volume_ok = c_vol > float(vma)
+    spread_ok = spread <= cfg.max_spread
+    if not volume_ok:
+        reasons.append(f"volume_filter_fail vol={c_vol:.4f} vma={float(vma):.4f}")
+    if not spread_ok:
+        reasons.append(f"spread_filter_fail spread={fmt4(spread)} max={fmt4(cfg.max_spread)}")
+    if reasons:
+        return SignalCheck(candidate=None, reject_reasons=reasons)
+
+    long_trend = c_close > float(e50)
+    short_trend = c_close < float(e50)
+    long_trigger = prev_close <= float(prev_e20) and c_close > float(e20)
+    short_trigger = prev_close >= float(prev_e20) and c_close < float(e20)
+
+    rsi_val = d(r)
+    long_rsi_ok = (rsi_val > cfg.rsi_threshold) if cfg.use_rsi_filter else True
+    short_rsi_ok = (rsi_val < cfg.rsi_threshold) if cfg.use_rsi_filter else True
+
+    direction: str | None = None
+    if long_trend and long_trigger and long_rsi_ok:
+        direction = "LONG"
+    elif short_trend and short_trigger and short_rsi_ok:
+        direction = "SHORT"
+
+    if direction is None:
+        if not long_trend and not short_trend:
+            reasons.append("trend_filter_fail")
+        if not long_trigger and not short_trigger:
+            reasons.append("pullback_trigger_fail")
+        if cfg.use_rsi_filter and not (long_rsi_ok or short_rsi_ok):
+            reasons.append(f"rsi_filter_fail rsi={fmt4(rsi_val)} threshold={fmt4(cfg.rsi_threshold)}")
+        return SignalCheck(candidate=None, reject_reasons=reasons or ["no_direction"])
+
+    atr_val = d(a)
+    if atr_val <= DEC_ZERO:
+        return SignalCheck(candidate=None, reject_reasons=["atr_non_positive"])
+
+    volume_ratio = d(c_vol) / d(vma)
+    atr_pct = atr_val / c.close if c.close > DEC_ZERO else DEC_ZERO
+    score = (volume_ratio / (spread + EPS)) * (DEC_ONE + atr_pct)
+
+    return SignalCheck(
+        candidate=CandidateSignal(
+            symbol=symbol,
+            direction=direction,
+            score=score,
+            spread=spread,
+            atr_value=atr_val,
+            volume_ratio=volume_ratio,
+            rsi_value=rsi_val,
+            bid=bid,
+            ask=ask,
+        ),
+        reject_reasons=[],
+    )
+
+def create_position_from_candidate(cfg: Config, candidate: CandidateSignal, latest_close_time: int) -> Position | None:
+    entry_fill = candidate.ask if candidate.direction == "LONG" else candidate.bid
+    if entry_fill <= DEC_ZERO:
+        return None
+
+    notional = cfg.margin_per_trade * cfg.leverage  # must remain 90*3 by default
+    qty = notional / entry_fill
+    if qty <= DEC_ZERO:
+        return None
+
+    risk = cfg.atr_sl_mult * candidate.atr_value
+    if risk <= DEC_ZERO:
+        return None
+
+    if candidate.direction == "LONG":
+        stop_loss = entry_fill - risk
+        take_profit = entry_fill + (cfg.rr_ratio * risk)
     else:
-        sl_hit = candle.high >= position.stop_loss
-        tp_hit = candle.low <= position.take_profit
-        if sl_hit and tp_hit:
-            exit_price, reason = position.stop_loss, "SL_and_TP_same_candle_assume_SL"
-        elif sl_hit:
-            exit_price, reason = position.stop_loss, "SL"
-        elif tp_hit:
-            exit_price, reason = position.take_profit, "TP"
+        stop_loss = entry_fill + risk
+        take_profit = entry_fill - (cfg.rr_ratio * risk)
 
-    if exit_price is None:
+    return Position(
+        symbol=candidate.symbol,
+        direction=candidate.direction,
+        entry_time=latest_close_time,
+        entry_fill_price=entry_fill,
+        qty=qty,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+        entry_notional=entry_fill * qty,
+        entry_spread=candidate.spread,
+        volume_ratio=candidate.volume_ratio,
+        rsi_value=candidate.rsi_value,
+    )
+
+
+def evaluate_live_exit(position: Position, bid: Decimal, ask: Decimal, fee_rate: Decimal, balance: Decimal) -> tuple[Trade | None, Decimal]:
+    exit_reason = ""
+    exit_fill: Decimal | None = None
+
+    # Conservative trigger + executable fill
+    if position.direction == "LONG":
+        if bid <= position.stop_loss:
+            exit_reason = "SL"
+            exit_fill = bid
+        elif bid >= position.take_profit:
+            exit_reason = "TP"
+            exit_fill = bid
+    else:
+        if ask >= position.stop_loss:
+            exit_reason = "SL"
+            exit_fill = ask
+        elif ask <= position.take_profit:
+            exit_reason = "TP"
+            exit_fill = ask
+
+    if exit_fill is None:
         return None, balance
 
-    entry_notional = position.entry_price * position.qty
-    exit_notional = exit_price * position.qty
-    fees = (entry_notional * fee_rate) + (exit_notional * fee_rate)
+    exit_notional = exit_fill * position.qty
+    fees = (position.entry_notional * fee_rate) + (exit_notional * fee_rate)
 
-    gross = (
-        (exit_price - position.entry_price) * position.qty
-        if position.direction == "LONG"
-        else (position.entry_price - exit_price) * position.qty
-    )
+    if position.direction == "LONG":
+        gross = (exit_fill - position.entry_fill_price) * position.qty
+        dir_ar = "شراء"
+    else:
+        gross = (position.entry_fill_price - exit_fill) * position.qty
+        dir_ar = "بيع"
+
     net = gross - fees
-    balance += net
+    new_balance = balance + net
 
-    return (
-        Trade(
-            timestamp=candle.close_time,
-            entry_price=position.entry_price,
-            exit_price=exit_price,
-            position_size=position.qty,
-            direction=position.direction.lower(),
-            gross_pnl=gross,
-            fees=fees,
-            net_pnl=net,
-            balance=balance,
-            exit_reason=reason,
-        ),
-        balance,
+    trade = Trade(
+        timestamp=now_ms(),
+        symbol=position.symbol,
+        direction=dir_ar,
+        entry_fill_price=position.entry_fill_price,
+        exit_fill_price=exit_fill,
+        quantity=position.qty,
+        entry_notional=position.entry_notional,
+        exit_notional=exit_notional,
+        gross_pnl=gross,
+        fees=fees,
+        net_pnl=net,
+        balance_after=new_balance,
+        exit_reason=exit_reason,
+    )
+    return trade, new_balance
+
+
+def estimate_unrealized(position: Position, bid: Decimal, ask: Decimal, fee_rate: Decimal) -> tuple[Decimal, Decimal]:
+    if position.direction == "LONG":
+        exit_fill = bid
+        gross = (exit_fill - position.entry_fill_price) * position.qty
+    else:
+        exit_fill = ask
+        gross = (position.entry_fill_price - exit_fill) * position.qty
+
+    exit_notional = exit_fill * position.qty
+    est_fees = (position.entry_notional * fee_rate) + (exit_notional * fee_rate)
+    net_est = gross - est_fees
+    return gross, net_est
+
+
+# -----------------------------
+# Telegram message builders (Arabic)
+# -----------------------------
+def send_entry_alert_ar(session: requests.Session, cfg: Config, pos: Position, candidate: CandidateSignal) -> None:
+    msg = (
+        "🟢 فتح صفقة (تجريبي)\n"
+        f"🕒 الوقت (القاهرة): {cairo_now_text()}\n"
+        f"📌 الرمز: {pos.symbol}\n"
+        f"📈 الاتجاه: {'شراء' if pos.direction == 'LONG' else 'بيع'}\n"
+        f"⚙️ الرافعة: x{fmt2(cfg.leverage)} | الهامش: {fmt2(cfg.margin_per_trade)} USDT | النوتيشنال: {fmt2(cfg.margin_per_trade * cfg.leverage)} USDT\n"
+        f"💲 سعر الدخول (تنفيذ): {fmt4(pos.entry_fill_price)} | Bid: {fmt4(candidate.bid)} | Ask: {fmt4(candidate.ask)}\n"
+        f"↔️ السبريد: {fmt4(candidate.spread)}\n"
+        f"🛑 وقف الخسارة: {fmt4(pos.stop_loss)} | 🎯 جني الأرباح: {fmt4(pos.take_profit)}\n"
+        f"📊 Volume/VMA20: {fmt4(pos.volume_ratio)} | RSI: {fmt4(pos.rsi_value)} {'(مفعل)' if cfg.use_rsi_filter else '(غير مفعل)'}"
+    )
+    send_telegram_message(session, msg)
+
+
+def send_exit_alert_ar(session: requests.Session, trade: Trade) -> None:
+    msg = (
+        "🔴 إغلاق صفقة\n"
+        f"🕒 الوقت (القاهرة): {cairo_now_text()}\n"
+        f"📌 الرمز: {trade.symbol} | الاتجاه: {trade.direction}\n"
+        f"💲 دخول: {fmt4(trade.entry_fill_price)} | خروج: {fmt4(trade.exit_fill_price)}\n"
+        f"📦 الكمية: {fmt6(trade.quantity)}\n"
+        f"📈 الربح/الخسارة الإجمالي: {fmt4(trade.gross_pnl)} USDT\n"
+        f"💸 العمولات: {fmt4(trade.fees)} USDT\n"
+        f"✅ الصافي: {fmt4(trade.net_pnl)} USDT\n"
+        f"💼 الرصيد بعد الإغلاق: {fmt4(trade.balance_after)} USDT\n"
+        f"🧾 سبب الإغلاق: {trade.exit_reason}"
+    )
+    send_telegram_message(session, msg)
+
+
+def send_hourly_summary_ar(
+    session: requests.Session,
+    summary: HourlySummary,
+    open_position: Position | None,
+    unrealized_net: Decimal | None,
+) -> None:
+    if open_position is None:
+        pos_line = "🟢 حالة الصفقة الحالية: لا توجد صفقة مفتوحة"
+    else:
+        pos_line = (
+            "🟠 حالة الصفقة الحالية: "
+            f"{open_position.symbol} | {'شراء' if open_position.direction == 'LONG' else 'بيع'} "
+            f"| PnL غير محقق: {fmt4(unrealized_net or DEC_ZERO)} USDT"
+        )
+
+    msg = (
+        "📊 الملخص الساعي\n"
+        f"🕒 الوقت (القاهرة): {cairo_now_text()}\n"
+        f"ربح آخر ساعة: {fmt4(summary.profit_last_hour)} USDT\n"
+        f"خسارة آخر ساعة: {fmt4(summary.loss_last_hour)} USDT\n"
+        f"صافي آخر ساعة: {fmt4(summary.net_last_hour)} USDT\n"
+        f"إجمالي الربح منذ البداية: {fmt4(summary.profit_total)} USDT\n"
+        f"إجمالي الخسارة منذ البداية: {fmt4(summary.loss_total)} USDT\n"
+        f"صافي الإجمالي منذ البداية: {fmt4(summary.net_total)} USDT\n"
+        f"العمولات (آخر ساعة): {fmt4(summary.fees_last_hour)} USDT\n"
+        f"العمولات (إجمالي): {fmt4(summary.fees_total)} USDT\n"
+        f"عدد الصفقات: {summary.total_trades} | رابحة: {summary.wins} | خاسرة: {summary.losses} | نسبة النجاح: {fmt2(summary.win_rate)}%\n"
+        f"💼 الرصيد الحالي: {fmt4(summary.balance)} USDT\n"
+        f"{pos_line}"
+    )
+    send_telegram_message(session, msg)
+
+
+# -----------------------------
+# Summary / heartbeat
+# -----------------------------
+def build_hourly_summary(trades: list[Trade], balance: Decimal, ts_ms: int) -> HourlySummary:
+    one_hour_ago = ts_ms - 3_600_000
+
+    last_hour = [t for t in trades if t.timestamp >= one_hour_ago]
+
+    profit_last_hour = sum((t.net_pnl for t in last_hour if t.net_pnl > DEC_ZERO), DEC_ZERO)
+    loss_last_hour = sum((t.net_pnl for t in last_hour if t.net_pnl < DEC_ZERO), DEC_ZERO)
+    net_last_hour = profit_last_hour + loss_last_hour
+
+    profit_total = sum((t.net_pnl for t in trades if t.net_pnl > DEC_ZERO), DEC_ZERO)
+    loss_total = sum((t.net_pnl for t in trades if t.net_pnl < DEC_ZERO), DEC_ZERO)
+    net_total = profit_total + loss_total
+
+    fees_last_hour = sum((t.fees for t in last_hour), DEC_ZERO)
+    fees_total = sum((t.fees for t in trades), DEC_ZERO)
+
+    wins = sum(1 for t in trades if t.net_pnl > DEC_ZERO)
+    losses = sum(1 for t in trades if t.net_pnl < DEC_ZERO)
+    total = len(trades)
+    win_rate = (d(wins) / d(total) * d("100")) if total > 0 else DEC_ZERO
+
+    return HourlySummary(
+        timestamp=ts_ms,
+        profit_last_hour=profit_last_hour,
+        loss_last_hour=loss_last_hour,
+        net_last_hour=net_last_hour,
+        profit_total=profit_total,
+        loss_total=loss_total,
+        net_total=net_total,
+        fees_last_hour=fees_last_hour,
+        fees_total=fees_total,
+        total_trades=total,
+        wins=wins,
+        losses=losses,
+        win_rate=win_rate,
+        balance=balance,
     )
 
 
-def run_backtest(session: requests.Session, cfg: Config) -> None:
-    candles = fetch_klines(session, cfg)
-    closes = [c.close for c in candles]
-    volumes = [c.volume for c in candles]
+def heartbeat_log(
+    cfg: Config,
+    open_position: Position | None,
+    mark_price: Decimal | None,
+    bid: Decimal | None,
+    ask: Decimal | None,
+    unrealized_net: Decimal | None,
+    sleep_seconds: float,
+) -> None:
+    now_local = datetime.now(tz=CAIRO_TZ)
+    next_check = now_local.timestamp() + sleep_seconds
+    next_check_text = datetime.fromtimestamp(next_check, tz=CAIRO_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
-    ema20 = ema(closes, cfg.ema_fast)
-    ema50 = ema(closes, cfg.ema_trend)
-    rsi14 = rsi(closes, cfg.rsi_period)
-    atr14 = atr(candles, cfg.atr_period)
-    vol_sma20 = sma(volumes, cfg.volume_ma_period)
+    if open_position is None:
+        pos_text = "لا توجد صفقة مفتوحة"
+    else:
+        mid = ((bid + ask) / d("2")) if bid is not None and ask is not None else None
+        current = mark_price if mark_price is not None else mid
+        pos_text = (
+            f"صفقة مفتوحة: {open_position.symbol} | {'شراء' if open_position.direction == 'LONG' else 'بيع'} "
+            f"| دخول={fmt4(open_position.entry_fill_price)} "
+            f"| السعر الحالي={fmt4(current) if current is not None else 'N/A'} "
+            f"| PnL غير محقق={fmt4(unrealized_net or DEC_ZERO)} USDT"
+        )
 
-    warmup = max(cfg.ema_trend, cfg.rsi_period, cfg.atr_period, cfg.volume_ma_period) + 1
+    logging.info(
+        "Heartbeat | القاهرة=%s | %s | النوم %.1f ثانية | الفحص القادم %s",
+        now_local.strftime("%Y-%m-%d %H:%M:%S"),
+        pos_text,
+        sleep_seconds,
+        next_check_text,
+    )
+
+
+# -----------------------------
+# Main live loop
+# -----------------------------
+def run_live_paper(session: requests.Session, cfg: Config) -> None:
+    balance = cfg.initial_balance
+    trades: list[Trade] = []
+    open_position: Position | None = None
+
+    init_trade_csv(cfg.trades_csv)
+    init_summary_csv(cfg.summary_csv)
+
+    # Align summary timer to wall-clock interval boundary
+    now_epoch = int(time.time())
+    next_summary_epoch = ((now_epoch // cfg.summary_interval_seconds) + 1) * cfg.summary_interval_seconds
+
+    loop_count = 0
+
+    logging.info(
+        "Starting PAPER live loop | balance=%s | margin=%s | leverage=%s | notional=%s | fee_rate=%s",
+        fmt2(cfg.initial_balance),
+        fmt2(cfg.margin_per_trade),
+        fmt2(cfg.leverage),
+        fmt2(cfg.margin_per_trade * cfg.leverage),
+        str(cfg.fee_rate),
+    )
+
+    while True:
+        loop_count += 1
+        loop_start = time.time()
+
+        hb_bid: Decimal | None = None
+        hb_ask: Decimal | None = None
+        hb_mark: Decimal | None = None
+        hb_unrealized_net: Decimal | None = None
+
+        try:
+            top_symbols = fetch_top_symbols(session, cfg.top_n_symbols)
+            logging.info("Top %d symbols by 24h quote volume: %s", cfg.top_n_symbols, ", ".join(top_symbols))
+
+            # 1) Manage open position first (single global position enforcement)
+            if open_position is not None:
+                bid, ask, _ = fetch_book_ticker(session, open_position.symbol)
+                hb_bid, hb_ask = bid, ask
+                hb_mark = fetch_mark_price(session, open_position.symbol)
+
+                trade, balance = evaluate_live_exit(open_position, bid, ask, cfg.fee_rate, balance)
+
+                # heartbeat unrealized when still open
+                if trade is None:
+                    _, hb_unrealized_net = estimate_unrealized(open_position, bid, ask, cfg.fee_rate)
+                else:
+                    trades.append(trade)
+                    append_trade_csv(cfg.trades_csv, trade)
+                    logging.info(
+                        "Closed %s %s | entry=%s exit=%s gross=%s fees=%s net=%s balance=%s reason=%s",
+                        trade.symbol,
+                        trade.direction,
+                        fmt4(trade.entry_fill_price),
+                        fmt4(trade.exit_fill_price),
+                        fmt4(trade.gross_pnl),
+                        fmt4(trade.fees),
+                        fmt4(trade.net_pnl),
+                        fmt4(trade.balance_after),
+                        trade.exit_reason,
+                    )
+                    if cfg.send_telegram:
+                        try:
+                            send_exit_alert_ar(session, trade)
+                        except Exception as exc:  # noqa: BLE001
+                            logging.error("Failed to send Telegram exit alert: %s", exc)
+                    open_position = None
+
+            # 2) If no position open, evaluate ALL top symbols and choose best score
+            can_open_more_by_count = cfg.max_total_trades is None or len(trades) < cfg.max_total_trades
+            if open_position is None and not can_open_more_by_count:
+                logging.info("Trade cap reached (max_total_trades=%s). New entries are disabled.", cfg.max_total_trades)
+
+            if open_position is None and can_open_more_by_count:
+                if balance < cfg.margin_per_trade:
+                    logging.info(
+                        "Skipping entries: balance (%s) < margin_per_trade (%s)",
+                        fmt2(balance),
+                        fmt2(cfg.margin_per_trade),
+                    )
+                else:
+                    candidates: list[tuple[CandidateSignal, int]] = []
+                    for symbol in top_symbols:
+                        try:
+                            candles = fetch_klines(session, symbol, cfg.interval, cfg.candle_limit)
+                            bid, ask, spread = fetch_book_ticker(session, symbol)
+                            check = evaluate_candidate_signal(cfg, symbol, candles, bid, ask, spread)
+                            candidate = check.candidate
+                            if candidate is not None:
+                                candidates.append((candidate, candles[-1].close_time))
+                                logging.info(
+                                    "Candidate %s | dir=%s score=%s vol_ratio=%s spread=%s atr=%s rsi=%s",
+                                    candidate.symbol,
+                                    candidate.direction,
+                                    fmt4(candidate.score),
+                                    fmt4(candidate.volume_ratio),
+                                    fmt4(candidate.spread),
+                                    fmt4(candidate.atr_value),
+                                    fmt4(candidate.rsi_value),
+                                )
+                            else:
+                                logging.info("Rejected %s signal: %s", symbol, "; ".join(check.reject_reasons))
+                        except Exception as exc:  # noqa: BLE001
+                            logging.warning("Signal scan failed for %s: %s", symbol, exc)
+
+                    if candidates:
+                        chosen, close_time = max(candidates, key=lambda x: x[0].score)
+                        position = create_position_from_candidate(cfg, chosen, close_time)
+                        if position is not None:
+                            if open_position is not None:
+                                logging.error("Single-position guard violated; refusing new entry on %s", chosen.symbol)
+                            else:
+                                open_position = position
+                            logging.info(
+                                "Chosen %s | dir=%s score=%s (vol_ratio=%s spread=%s atr=%s) | entry_fill=%s",
+                                chosen.symbol,
+                                chosen.direction,
+                                fmt4(chosen.score),
+                                fmt4(chosen.volume_ratio),
+                                fmt4(chosen.spread),
+                                fmt4(chosen.atr_value),
+                                fmt4(position.entry_fill_price),
+                            )
+                            if cfg.send_telegram:
+                                try:
+                                    send_entry_alert_ar(session, cfg, position, chosen)
+                                except Exception as exc:  # noqa: BLE001
+                                    logging.error("Failed to send Telegram entry alert: %s", exc)
+                    else:
+                        logging.info("No valid entry candidates this loop.")
+
+            # 3) Hourly summary (exactly at interval boundary or first pass after it)
+            now_epoch = int(time.time())
+            if now_epoch >= next_summary_epoch:
+                summary = build_hourly_summary(trades, balance, now_ms())
+                append_summary_csv(cfg.summary_csv, summary)
+
+                if open_position is not None:
+                    try:
+                        bid, ask, _ = fetch_book_ticker(session, open_position.symbol)
+                        _, hb_unrealized_net = estimate_unrealized(open_position, bid, ask, cfg.fee_rate)
+                        hb_bid, hb_ask = bid, ask
+                        hb_mark = fetch_mark_price(session, open_position.symbol)
+                    except Exception as exc:  # noqa: BLE001
+                        logging.warning("Could not refresh open-position metrics for summary: %s", exc)
+
+                logging.info(
+                    "Hourly summary | net_last_hour=%s net_total=%s fees_hour=%s fees_total=%s trades=%d win_rate=%s%% balance=%s",
+                    fmt4(summary.net_last_hour),
+                    fmt4(summary.net_total),
+                    fmt4(summary.fees_last_hour),
+                    fmt4(summary.fees_total),
+                    summary.total_trades,
+                    fmt2(summary.win_rate),
+                    fmt4(summary.balance),
+                )
+
+                if cfg.send_telegram:
+                    try:
+                        send_hourly_summary_ar(session, summary, open_position, hb_unrealized_net)
+                    except Exception as exc:  # noqa: BLE001
+                        logging.error("Failed to send Telegram hourly summary: %s", exc)
+
+                while next_summary_epoch <= now_epoch:
+                    next_summary_epoch += cfg.summary_interval_seconds
+
+        except Exception as exc:  # noqa: BLE001
+            logging.error("Main loop error: %s", exc)
+
+        elapsed = time.time() - loop_start
+        sleep_seconds = max(1.0, cfg.loop_sleep_seconds - elapsed)
+
+        heartbeat_log(
+            cfg,
+            open_position,
+            hb_mark,
+            hb_bid,
+            hb_ask,
+            hb_unrealized_net,
+            sleep_seconds,
+        )
+
+        if cfg.max_loops is not None and loop_count >= cfg.max_loops:
+            logging.info("Reached max_loops=%d, exiting.", cfg.max_loops)
+            break
+
+        time.sleep(sleep_seconds)
+
+
+
+
+# -----------------------------
+# Backtest data loaders
+# -----------------------------
+def load_local_klines(data_dir: str, symbol: str, interval: str) -> list[Candle]:
+    base = Path(data_dir) / "klines" / symbol / interval
+    parquet_path = base / "merged.parquet"
+    csv_path = base / "merged.csv"
+
+    rows: list[list[str]] = []
+    if parquet_path.exists():
+        try:
+            import pandas as pd  # type: ignore
+
+            df = pd.read_parquet(parquet_path)
+            rows = df.astype(str).values.tolist()
+        except Exception:
+            rows = []
+
+    if not rows:
+        if not csv_path.exists():
+            raise FileNotFoundError(f"Local merged data not found: {csv_path}")
+        with csv_path.open("r", newline="", encoding="utf-8") as f:
+            r = csv.reader(f)
+            next(r, None)
+            for row in r:
+                if len(row) >= 12:
+                    rows.append(row[:12])
+
+    candles: list[Candle] = []
+    for r in rows:
+        candles.append(
+            Candle(
+                open_time=int(r[0]),
+                open=d(r[1]),
+                high=d(r[2]),
+                low=d(r[3]),
+                close=d(r[4]),
+                volume=d(r[5]),
+                close_time=int(r[6]),
+            )
+        )
+    return candles
+
+
+def fetch_klines_rest_for_backtest(session: requests.Session, symbol: str, interval: str, limit: int = 1500) -> list[Candle]:
+    resp = request_with_retry(
+        session,
+        "GET",
+        f"{FUTURES_BASE}{KLINES_ENDPOINT}",
+        params={"symbol": symbol, "interval": interval, "limit": limit},
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Backtest klines fetch failed: HTTP {resp.status_code} - {resp.text}")
+    payload = resp.json()
+    if not isinstance(payload, list):
+        raise RuntimeError("Unexpected klines payload")
+    return [
+        Candle(
+            open_time=int(x[0]),
+            open=d(x[1]),
+            high=d(x[2]),
+            low=d(x[3]),
+            close=d(x[4]),
+            volume=d(x[5]),
+            close_time=int(x[6]),
+        )
+        for x in payload
+    ]
+
+
+def run_backtest_mode(session: requests.Session, cfg: Config, symbol: str, data_dir: str | None) -> None:
+    candles = load_local_klines(data_dir, symbol, cfg.interval) if data_dir else fetch_klines_rest_for_backtest(session, symbol, cfg.interval)
+    if len(candles) < 100:
+        raise RuntimeError("Not enough candles for backtest")
+
+    closes = [float(c.close) for c in candles]
+    volumes = [float(c.volume) for c in candles]
+    e20 = ema(closes, cfg.ema_fast)
+    e50 = ema(closes, cfg.ema_trend)
+    rsi_vals = rsi(closes, cfg.rsi_period)
+    atr_vals = atr(candles, cfg.atr_period)
+    vma = sma(volumes, cfg.volume_ma_period)
 
     balance = cfg.initial_balance
-    equity_curve = [balance]
+    pos: Position | None = None
     trades: list[Trade] = []
-    open_positions: list[Position] = []
 
-    spread_cache: float | None = None
-
-    for i in range(warmup, len(candles)):
+    for i in range(max(cfg.ema_trend, cfg.atr_period, cfg.volume_ma_period, cfg.rsi_period) + 1, len(candles)):
         c = candles[i]
         prev = candles[i - 1]
 
-        # Spread check from futures book ticker
-        try:
-            spread_cache = fetch_spread(session, cfg.symbol)
-        except Exception as exc:  # noqa: BLE001
-            logging.warning("Spread fetch failed at i=%d: %s", i, exc)
-            if spread_cache is None:
-                continue
+        if pos is not None:
+            # candle-based conservative exit in backtest mode
+            if pos.direction == "LONG":
+                bid = c.low
+                ask = c.high
+            else:
+                bid = c.low
+                ask = c.high
+            trade, balance = evaluate_live_exit(pos, bid, ask, cfg.fee_rate, balance)
+            if trade is not None:
+                trades.append(trade)
+                pos = None
 
-        spread = spread_cache
-        e20 = ema20[i]
-        e50 = ema50[i]
-        r = rsi14[i]
-        a = atr14[i]
-        vma = vol_sma20[i]
-
-        if e20 is None or e50 is None or r is None or a is None or vma is None:
+        if pos is not None:
             continue
 
-        # Manage existing open positions (trailing + exits)
-        still_open: list[Position] = []
-        for p in open_positions:
-            if cfg.use_trailing_stop:
-                if p.direction == "LONG":
-                    p.stop_loss = max(p.stop_loss, c.close - (cfg.trailing_atr_mult * a))
-                else:
-                    p.stop_loss = min(p.stop_loss, c.close + (cfg.trailing_atr_mult * a))
+        if cfg.max_total_trades is not None and len(trades) >= cfg.max_total_trades:
+            continue
 
-            trade, balance = evaluate_exit(p, c, cfg.fee_rate, balance)
-            if trade is None:
-                still_open.append(p)
-                continue
+        if balance < cfg.margin_per_trade:
+            continue
 
-            trades.append(trade)
-            equity_curve.append(balance)
-            logging.info(
-                "Closed %s entry=%.4f exit=%.4f gross=%.4f fees=%.4f net=%.4f bal=%.4f",
-                trade.direction,
-                trade.entry_price,
-                trade.exit_price,
-                trade.gross_pnl,
-                trade.fees,
-                trade.net_pnl,
-                trade.balance,
-            )
+        if any(x is None for x in [e20[i], e50[i], rsi_vals[i], atr_vals[i], vma[i], e20[i - 1]]):
+            continue
 
-            if cfg.send_telegram:
-                try:
-                    send_telegram_message(
-                        session,
-                        (
-                            "Trade Closed\n"
-                            f"Symbol: {cfg.symbol}\n"
-                            f"Direction: {trade.direction}\n"
-                            f"Entry: {trade.entry_price:.4f}\n"
-                            f"Exit: {trade.exit_price:.4f}\n"
-                            f"Net P/L: {trade.net_pnl:.4f} USD\n"
-                            f"Balance: {trade.balance:.4f} USD"
-                        ),
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logging.error("Telegram trade message failed: %s", exc)
-
-        open_positions = still_open
-
-        # Filters
-        volume_ok = c.volume > vma
+        spread = DEC_ZERO
+        volume_ok = d(volumes[i]) > d(vma[i])
         spread_ok = spread <= cfg.max_spread
-        logging.info(
-            "Filter check i=%d volume_ok=%s spread_ok=%s vol=%.6f vma=%.6f spread=%.6f",
-            i,
-            volume_ok,
-            spread_ok,
-            c.volume,
-            vma,
-            spread,
-        )
-
-        if len(open_positions) >= cfg.max_concurrent_positions:
-            continue
         if not volume_ok or not spread_ok:
             continue
 
-        # Trend Pullback entries (preserved)
-        long_trend = c.close > e50
-        short_trend = c.close < e50
-        prev_e20 = ema20[i - 1] if ema20[i - 1] is not None else e20
-        long_trigger = prev.close <= prev_e20 and c.close > e20
-        short_trigger = prev.close >= prev_e20 and c.close < e20
+        long_trend = closes[i] > float(e50[i])
+        short_trend = closes[i] < float(e50[i])
+        long_trigger = float(prev.close) <= float(e20[i - 1]) and closes[i] > float(e20[i])
+        short_trigger = float(prev.close) >= float(e20[i - 1]) and closes[i] < float(e20[i])
 
+        r = d(rsi_vals[i])
         long_rsi_ok = (r > cfg.rsi_threshold) if cfg.use_rsi_filter else True
         short_rsi_ok = (r < cfg.rsi_threshold) if cfg.use_rsi_filter else True
 
-        direction: str | None = None
+        direction = None
         if long_trend and long_trigger and long_rsi_ok:
             direction = "LONG"
         elif short_trend and short_trigger and short_rsi_ok:
             direction = "SHORT"
-
         if direction is None:
             continue
 
-        risk = cfg.atr_sl_mult * a
-        if risk <= 0:
-            continue
-
-        entry = c.close
-        # Fixed 90 USD per trade (or whatever config says), capped by available balance.
-        notional = min(cfg.trade_size_usd, balance)
-        qty = notional / entry if entry > 0 else 0.0
-        if qty <= 0:
-            continue
-
-        if direction == "LONG":
-            stop = entry - risk
-            take = entry + (cfg.rr_ratio * risk)
-        else:
-            stop = entry + risk
-            take = entry - (cfg.rr_ratio * risk)
-
-        open_positions.append(
-            Position(
-                direction=direction,
-                entry_time=c.close_time,
-                entry_price=entry,
-                qty=qty,
-                stop_loss=stop,
-                take_profit=take,
-            )
+        atr_val = d(atr_vals[i])
+        cand = CandidateSignal(
+            symbol=symbol,
+            direction=direction,
+            score=d("1"),
+            spread=spread,
+            atr_value=atr_val,
+            volume_ratio=d(volumes[i]) / d(vma[i]),
+            rsi_value=r,
+            bid=c.close,
+            ask=c.close,
         )
-        logging.info("Opened %s entry=%.4f qty=%.6f sl=%.4f tp=%.4f", direction, entry, qty, stop, take)
+        pos = create_position_from_candidate(cfg, cand, c.close_time)
 
-    write_trades_csv(cfg.output_csv, trades)
+    total_net = sum((t.net_pnl for t in trades), DEC_ZERO)
+    wins = sum(1 for t in trades if t.net_pnl > DEC_ZERO)
+    print("=== Backtest Summary ===")
+    print(f"Symbol: {symbol}")
+    print(f"Interval: {cfg.interval}")
+    print(f"Trades: {len(trades)}")
+    print(f"Win rate: {(wins/len(trades)*100 if trades else 0):.2f}%")
+    print(f"Net PnL: {fmt4(total_net)} USDT")
+    print(f"Final balance: {fmt4(balance)} USDT")
 
-    # Summary metrics
-    total_trades = len(trades)
-    wins = sum(1 for t in trades if t.net_pnl > 0)
-    win_rate = (wins / total_trades * 100.0) if total_trades else 0.0
-    total_net = sum(t.net_pnl for t in trades)
-    avg_return = (total_net / total_trades) if total_trades else 0.0
-    max_dd = max_drawdown(equity_curve) * 100.0
-    final_balance = balance
 
-    summary = (
-        "Backtest Summary\n"
-        f"Symbol: {cfg.symbol}\n"
-        f"Interval: {cfg.interval}\n"
-        f"Total Trades: {total_trades}\n"
-        f"Total Net Profit/Loss: {total_net:.4f} USD\n"
-        f"Win Rate: {win_rate:.2f}%\n"
-        f"Average Return/Trade: {avg_return:.4f} USD\n"
-        f"Max Drawdown: {max_dd:.2f}%\n"
-        f"Final Account Balance: {final_balance:.4f} USD\n"
-        f"CSV: {cfg.output_csv}"
-    )
-
-    print("\n=== Backtest Summary ===")
-    print(summary)
-
-    if cfg.send_telegram:
-        try:
-            send_telegram_message(session, summary)
-        except Exception as exc:  # noqa: BLE001
-            logging.error("Telegram summary failed: %s", exc)
+def write_runtime_system_report() -> None:
+    report = {
+        "single_position_enforced": True,
+        "defaults": {
+            "initial_balance": "100",
+            "margin_per_trade": "90",
+            "leverage": "3",
+            "fee_rate": "0.0004",
+            "top_n_symbols": 5,
+            "summary_interval_seconds": 3600,
+        },
+        "examples": {
+            "download": "python download_um_futures_klines.py --symbols BTCUSDT,ETHUSDT --intervals 15m,1h --start 2023-02-17 --end 2026-02-17 --out data/um_futures",
+            "backtest": "python futures_trend_pullback_telegram.py --mode backtest --symbol BTCUSDT --interval 1h --data-dir data/um_futures",
+            "live": "python futures_trend_pullback_telegram.py --mode live",
+        },
+    }
+    out = Path("runtime_system_report.json")
+    out.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    logging.info("Runtime system report saved: %s", out)
 
 
 # -----------------------------
-# CLI entrypoint
+# CLI
 # -----------------------------
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Unified Binance Futures Trend Pullback backtest + Telegram")
-    parser.add_argument("--config", type=str, help="Path to JSON config")
-    parser.add_argument("--symbol", type=str)
-    parser.add_argument("--interval", type=str)
-    parser.add_argument("--limit", type=int)
-    parser.add_argument("--start-time-ms", type=int)
-    parser.add_argument("--end-time-ms", type=int)
-    parser.add_argument("--max-spread", type=float)
-    parser.add_argument("--fee-rate", type=float)
-    parser.add_argument("--trade-size-usd", type=float)
-    parser.add_argument("--output-csv", type=str)
-    parser.add_argument("--max-concurrent-positions", type=int)
-    parser.add_argument("--no-telegram", action="store_true")
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description="Live/Backtest Binance USD-M futures PAPER simulator with Arabic Telegram alerts")
+    p.add_argument("--mode", type=str, default="live", choices=["live", "backtest"])
+    p.add_argument("--symbol", type=str, default="BTCUSDT")
+    p.add_argument("--data-dir", type=str, help="Path like data/um_futures for local merged klines")
+    p.add_argument("--interval", type=str)
+    p.add_argument("--candle-limit", type=int)
+    p.add_argument("--top-n-symbols", type=int)
+    p.add_argument("--fee-rate", type=str)
+    p.add_argument("--leverage", type=str)
+    p.add_argument("--margin-per-trade", type=str)
+    p.add_argument("--max-spread", type=str)
+    p.add_argument("--summary-interval-seconds", type=int)
+    p.add_argument("--loop-sleep-seconds", type=int)
+    p.add_argument("--max-total-trades", type=int)
+    p.add_argument("--no-telegram", action="store_true")
+    p.add_argument("--max-loops", type=int, help="testing helper")
+    return p.parse_args()
 
 
 def build_config(args: argparse.Namespace) -> Config:
-    cfg = load_env_config()
-    if args.config:
-        cfg = merge_config(cfg, load_json_config(args.config))
+    cfg = load_config_from_env()
 
-    if args.symbol:
-        cfg.symbol = args.symbol
     if args.interval:
         cfg.interval = args.interval
-    if args.limit is not None:
-        cfg.limit = args.limit
-    if args.start_time_ms is not None:
-        cfg.start_time_ms = args.start_time_ms
-    if args.end_time_ms is not None:
-        cfg.end_time_ms = args.end_time_ms
-    if args.max_spread is not None:
-        cfg.max_spread = args.max_spread
+    if args.candle_limit is not None:
+        cfg.candle_limit = args.candle_limit
+    if args.top_n_symbols is not None:
+        cfg.top_n_symbols = args.top_n_symbols
     if args.fee_rate is not None:
-        cfg.fee_rate = args.fee_rate
-    if args.trade_size_usd is not None:
-        cfg.trade_size_usd = args.trade_size_usd
-    if args.output_csv:
-        cfg.output_csv = args.output_csv
-    if args.max_concurrent_positions is not None:
-        cfg.max_concurrent_positions = args.max_concurrent_positions
+        cfg.fee_rate = d(args.fee_rate)
+    if args.leverage is not None:
+        cfg.leverage = d(args.leverage)
+    if args.margin_per_trade is not None:
+        cfg.margin_per_trade = d(args.margin_per_trade)
+    if args.max_spread is not None:
+        cfg.max_spread = d(args.max_spread)
+    if args.summary_interval_seconds is not None:
+        cfg.summary_interval_seconds = args.summary_interval_seconds
+    if args.loop_sleep_seconds is not None:
+        cfg.loop_sleep_seconds = args.loop_sleep_seconds
+    if args.max_total_trades is not None:
+        cfg.max_total_trades = args.max_total_trades
+    if args.max_loops is not None:
+        cfg.max_loops = args.max_loops
     if args.no_telegram:
         cfg.send_telegram = False
 
@@ -809,21 +1411,19 @@ def build_config(args: argparse.Namespace) -> Config:
 def main() -> int:
     setup_logging()
     maybe_load_dotenv()
+
     try:
-        cfg = build_config(parse_args())
-        logging.info(
-            "Starting paper backtest symbol=%s interval=%s limit=%d fee=%.6f trade_size=%.2f",
-            cfg.symbol,
-            cfg.interval,
-            cfg.limit,
-            cfg.fee_rate,
-            cfg.trade_size_usd,
-        )
+        args = parse_args()
+        cfg = build_config(args)
+        write_runtime_system_report()
         with requests.Session() as session:
-            run_backtest(session, cfg)
+            if args.mode == "backtest":
+                run_backtest_mode(session, cfg, args.symbol.upper(), args.data_dir)
+            else:
+                run_live_paper(session, cfg)
         return 0
     except Exception as exc:  # noqa: BLE001
-        logging.error("Script failed: %s", exc)
+        logging.error("Fatal error: %s", exc)
         return 1
 
 
